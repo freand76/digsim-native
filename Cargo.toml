@@ -10,7 +10,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # abi3: one build per platform works on every Python from 3.11
-pyo3 = { version = "0.28.3", features = ["extension-module", "abi3-py311"] }
+pyo3 = { version = "0.28.3", features = ["extension-module", "abi3-py311", "num-bigint"] }
+num-bigint = "0.4.6"
+num-integer = "0.1.46"
+num-traits = "0.2.19"
 
 [profile.release]
 lto = true

@@ -17,6 +17,10 @@ use pyo3::types::{PyInt, PyString};
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
+mod bits;
+mod word;
+use num_bigint::{BigInt, BigUint};
+
 trait Timed {
     fn time(&self) -> i64;
 }
@@ -169,7 +173,9 @@ const IN: u8 = 1; // Input of a native cell that updates the cell (PortIn)
 const WIRE: u8 = 2; // Input of a native cell that doesn't (PortWire)
 const BIT: u8 = 4; // A bit of a native bus (PortWireBit)
 const BUS: u8 = 5; // A bus of bits, up to 64 (PortMultiBitWire)
-                   // 3 is the output of a native cell (PortOutDelta), never driven
+const CELL_INPUT: u8 = 6; // A bit of an input of a functional cell (_CellInput)
+const WORD: u8 = 7; // The word output of a functional cell (_WordOut)
+                    // 3 is the output of a native cell (PortOutDelta), never driven
 
 /// The value of a bus: a number, or all bits the same code (X or Z)
 #[derive(Clone, Copy, PartialEq)]
@@ -181,6 +187,8 @@ enum BusValue {
 enum Value {
     Bit(u8),
     Bus(BusValue),
+    // A word of a functional cell output: the bits and, above them, the undefined bits
+    Word(bits::Bits),
     Python(Py<PyAny>),
 }
 
@@ -189,6 +197,7 @@ impl Value {
         match self {
             Value::Bit(v) => Value::Bit(*v),
             Value::Bus(v) => Value::Bus(*v),
+            Value::Word(v) => Value::Word(v.clone()),
             Value::Python(v) => Value::Python(v.clone_ref(py)),
         }
     }
@@ -351,14 +360,19 @@ struct Inner {
     time: i64,
     seq: u64,
     kind: Vec<u8>,
-    // The cell of a cell port, the bus port of a bit, the bus of a bus port
+    // The cell of a cell port, the bus port of a bit, the bus of a bus port, the
+    // functional cell of a port of one
     owner: Vec<u32>,
+    // Functional cells: the input and bit of an input bit (input << 20 | bit), the output
+    // of a word port
+    aux: Vec<u32>,
     value: Vec<u8>,
     wired: Vec<Vec<u32>>,
     delay: Vec<i64>,
     toplevel: Vec<bool>,
     cells: Vec<Cell>,
     buses: Vec<Bus>,
+    words: Vec<word::Cell>,
     heap: Vec<Event>,
     latest: Vec<Option<(u64, i64, Value)>>,
     // Statistics: events (native, Python), stale events, Python calls, cell evaluations
@@ -479,6 +493,25 @@ impl Inner {
     }
 }
 
+// A functional cell from Python: kind, inputs (width, update, bits, undefined bits),
+// outputs (width, bit ports, bits with ports that drive something, word port, links, last
+// value), parameters, Q and the clock level
+type WordCellArgs = (
+    u8,
+    Vec<(usize, bool, BigUint, BigUint)>,
+    Vec<(
+        usize,
+        Vec<u32>,
+        BigUint,
+        Option<u32>,
+        Vec<word::Link>,
+        Option<(BigUint, BigUint)>,
+    )>,
+    HashMap<String, BigInt>,
+    (BigUint, BigUint),
+    u8,
+);
+
 /// The simulation of a circuit, see digsim/circuit/_native.py
 #[pyclass(frozen)]
 struct Engine {
@@ -504,6 +537,7 @@ impl Engine {
         Ok(match value {
             Value::Bit(v) => self.values[*v as usize].bind(py).clone(),
             Value::Bus(v) => self.bus_object(py, *v)?,
+            Value::Word(v) => BigUint::from(v).into_pyobject(py)?.into_any(),
             Value::Python(v) => v.bind(py).clone(),
         })
     }
@@ -621,6 +655,19 @@ impl<'a, 'py> Ctx<'a, 'py> {
                 };
                 self.set_bus(port, value)?;
             }
+            CELL_INPUT => {
+                // _CellInput.set_value()
+                if value == self.st().value[p] {
+                    return Ok(());
+                }
+                self.update_wires(port, value)?;
+                let st = self.st();
+                let cell = st.owner[p] as usize;
+                let aux = st.aux[p] as usize;
+                if st.words[cell].set_bit(aux >> 20, aux & 0xFFFFF, value) {
+                    self.evaluate_word(cell);
+                }
+            }
             _ => {
                 let object = self.engine.values[value as usize].bind(self.py).clone();
                 self.call_set_value(port, object)?;
@@ -716,6 +763,62 @@ impl<'a, 'py> Ctx<'a, 'py> {
         }
     }
 
+    // The events of a functional cell
+    fn push_writes(&mut self, writes: Vec<word::Write>) {
+        let py = self.py;
+        let st = self.st();
+        for write in writes {
+            match write {
+                word::Write::Bit(port, code) => {
+                    let delay = st.delay[port as usize];
+                    st.push(py, port, Value::Bit(code), delay);
+                }
+                word::Write::Word(port, value) => {
+                    let delay = st.delay[port as usize];
+                    st.push(py, port, Value::Word(value), delay);
+                }
+            }
+        }
+    }
+
+    fn evaluate_word(&mut self, cell: usize) {
+        let st = self.st();
+        st.stats[4] += 1;
+        let mut writes = Vec::new();
+        st.words[cell].update(&mut writes);
+        self.push_writes(writes);
+    }
+
+    // _WordOut.delta_cycle(): set the bits of the cells it drives, then update them
+    fn word_event(&mut self, port: u32, value: &bits::Bits) {
+        let st = self.st();
+        let p = port as usize;
+        let cell = st.owner[p] as usize;
+        let output = st.aux[p] as usize;
+        let width = st.words[cell].outputs[output].width;
+        let bits = value & word::mask(width);
+        let undefined = value >> width;
+        let count = st.words[cell].outputs[output].links.len();
+        for index in 0..count {
+            let st = self.st();
+            let (target, links) = st.words[cell].outputs[output].links[index].clone();
+            let mut update = false;
+            for (input, offset, start, length) in links {
+                let m = word::mask(length);
+                let part = word::Word {
+                    v: (&bits >> start) & &m,
+                    u: (&undefined >> start) & &m,
+                };
+                if st.words[target].set_bits(input, offset, length, &part) {
+                    update = true;
+                }
+            }
+            if update {
+                self.evaluate_word(target);
+            }
+        }
+    }
+
     /// Process the next event, see Circuit.process_single_event(). Returns None if there
     /// is none before the stop time, otherwise the port.
     fn process(
@@ -738,6 +841,7 @@ impl<'a, 'py> Ctx<'a, 'py> {
                             && match (value, &event.value) {
                                 (Value::Bit(a), Value::Bit(b)) => a == b,
                                 (Value::Bus(a), Value::Bus(b)) => a == b,
+                                (Value::Word(a), Value::Word(b)) => a == b,
                                 (Value::Python(a), Value::Python(b)) => a.bind(py).eq(b.bind(py))?,
                                 _ => false,
                             })
@@ -760,6 +864,10 @@ impl<'a, 'py> Ctx<'a, 'py> {
                 }
                 // PortMultiBitWire.delta_cycle() does nothing
                 Value::Bus(_) => st.stats[0] += 1,
+                Value::Word(value) => {
+                    st.stats[0] += 1;
+                    self.word_event(event.port, &value);
+                }
                 Value::Python(value) => {
                     st.stats[1] += 1;
                     let engine = self.engine;
@@ -799,8 +907,55 @@ impl Engine {
         toplevel: Vec<bool>,
         cells: Vec<(u8, Vec<u32>, u32, [u8; 4], u8)>,
         buses: Vec<(Vec<u32>, Bound<'_, PyAny>)>,
+        aux: Vec<u32>,
+        words: Vec<WordCellArgs>,
         time: i64,
     ) -> PyResult<Self> {
+        let mut word_cells = Vec::with_capacity(words.len());
+        for (kind, inputs, outputs, params, q, old_clock) in words {
+            let kind = *word::KINDS.get(kind as usize).ok_or_else(|| {
+                PyValueError::new_err(format!("Unknown functional cell kind {kind}"))
+            })?;
+            let inputs = inputs
+                .into_iter()
+                .map(|(width, update, v, u)| word::Input {
+                    word: word::Word {
+                        v: v.into(),
+                        u: u.into(),
+                    },
+                    width,
+                    update,
+                })
+                .collect();
+            let outputs = outputs
+                .into_iter()
+                .map(
+                    |(width, bit_ports, bit_outputs, word_port, links, last)| word::Output {
+                        mask: word::mask(width),
+                        width,
+                        last: last.map(|(v, u)| word::Word {
+                            v: v.into(),
+                            u: u.into(),
+                        }),
+                        bit_ports,
+                        bit_outputs: bit_outputs.into(),
+                        word_port,
+                        links,
+                    },
+                )
+                .collect();
+            word_cells.push(word::Cell::new(
+                kind,
+                inputs,
+                outputs,
+                params,
+                word::Word {
+                    v: q.0.into(),
+                    u: q.1.into(),
+                },
+                old_clock,
+            ));
+        }
         let count = ports.len();
         let mut native_cells = Vec::with_capacity(cells.len());
         for (kind, inputs, output, levels, old_clock) in cells {
@@ -836,12 +991,14 @@ impl Engine {
                 seq: 0,
                 kind: kinds,
                 owner: owners,
+                aux,
                 value: values,
                 wired,
                 delay: delays,
                 toplevel,
                 cells: native_cells,
                 buses: native_buses,
+                words: word_cells,
                 heap: Vec::new(),
                 latest: (0..count).map(|_| None).collect(),
                 stats: [0; 5],
@@ -897,6 +1054,7 @@ impl Engine {
         let value = match st.kind[nid as usize] {
             PY => Value::Python(value.unbind()),
             BUS => Value::Bus(bus_value(&value)?),
+            WORD => Value::Word(bits::Bits::from(value.extract::<BigUint>()?)),
             _ => Value::Bit(bit_code(&value)?),
         };
         st.push(py, nid, value, delay);
@@ -959,6 +1117,7 @@ impl Engine {
         let nid = st.kind.len() as u32;
         st.kind.push(PY);
         st.owner.push(u32::MAX);
+        st.aux.push(0);
         st.value.push(X);
         st.wired.push(wired);
         st.delay.push(0);
@@ -992,6 +1151,48 @@ impl Engine {
             .map(|c| self.values[c.old_clock as usize].bind(py).clone())
             .collect();
         Ok((events, latest, clocks))
+    }
+
+    /// The default state of a functional cell, a register starts at 0
+    fn word_default_state(&self, py: Python<'_>, cell: usize) {
+        let mut ctx = Ctx::new(py, self);
+        let mut writes = Vec::new();
+        if ctx.st().words[cell].is_register() {
+            ctx.st().words[cell].default_state(&mut writes);
+        }
+        ctx.push_writes(writes);
+    }
+
+    /// The state of each functional cell for going back to Python: the values of its
+    /// inputs, the last values of its outputs, Q and the clock level
+    #[allow(clippy::type_complexity)]
+    fn export_words<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> Vec<(
+        Vec<(BigUint, BigUint)>,
+        Vec<Option<(BigUint, BigUint)>>,
+        (BigUint, BigUint),
+        Bound<'py, PyAny>,
+    )> {
+        let st = self.inner.lock().unwrap();
+        st.words
+            .iter()
+            .map(|cell| {
+                (
+                    cell.inputs
+                        .iter()
+                        .map(|i| ((&i.word.v).into(), (&i.word.u).into()))
+                        .collect(),
+                    cell.outputs
+                        .iter()
+                        .map(|o| o.last.as_ref().map(|w| ((&w.v).into(), (&w.u).into())))
+                        .collect(),
+                    ((&cell.q.v).into(), (&cell.q.u).into()),
+                    self.values[cell.old_clock as usize].bind(py).clone(),
+                )
+            })
+            .collect()
     }
 
     fn __len__(&self) -> usize {

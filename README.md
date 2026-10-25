@@ -18,8 +18,10 @@ events in Rust, the loop, the ports and all components in Python. The queue is C
 heapq algorithm step by step, so events at the same time keep their order.
 
 **Trial 2, the circuit handling too** (`Engine`): Rust runs the event loop, and simulates
-the Yosys gate cells (the gates, muxes and the D flip-flops with reset and enable) and the
-bus ports (`PortMultiBitWire` up to 64 bits and their `PortWireBit` bits). Every other
+the Yosys gate cells (the gates, muxes and the D flip-flops with reset and enable), the
+functional cells (`native/src/word.rs`: arithmetic, comparisons, shifts, muxes, the
+decoders, flip-flops and latches) and the bus ports (`PortMultiBitWire` up to 64 bits and
+their `PortWireBit` bits). Every other
 component and port stays in Python: the engine calls `set_value()` and `delta_cycle()` of
 Python ports from the same queue, and Python calls back into the engine through
 `Circuit.add_event()` and through the ports the engine took over. Those ports get a
@@ -37,12 +39,24 @@ Python 3.15.0, x86_64. Cycles per second, more is better:
 
 | Design | Python | Native queue | Native engine |
 | --- | ---: | ---: | ---: |
-| 6502, gates (`examples/yosys_6502`) | 801 | 1,135 | 8,103 (10x) |
+| 6502, gates (`examples/yosys_6502`) | 977 | 1,135 | 9,643 (10x) |
+| 6502, functional | 1,326 | | 13,529 (10x) |
 | rv32i, gates (riscv32/, 3000 cycles) | 117 | | 1,215 (10x) |
-| rv32i, functional | 578 | | 882 (1.5x) |
+| rv32i, functional (self test) | 603 | | 5,907 (10x) |
+| rv32imc, functional (self test) | 445 | | 4,380 (10x) |
 
-The first version of trial 2 had native cells but the bus ports in Python, and wrote every
-changed value back to its Python port after each run: 3.9x on the 6502 and 2.2x on rv32i.
+With Python the functional netlist is a little faster than the gates (fewer events), and
+natively it stays faster: rv32i functional is 5x its gates. Steps on the way:
+
+- Native gate cells, the bus ports in Python, and every changed value written back to its
+  Python port after each run: 3.9x on the 6502 and 2.2x on rv32i gates.
+- Native buses, and port values read from the engine instead of copied: 10x on the gates.
+- Native functional cells with `num-bigint` values: 4x on the 6502 functional, slower
+  than the gates. Every operation allocated, also for 8-bit words, and the parameters
+  were looked up by name in each update.
+- A number type that is a `u64` while it fits (`native/src/bits.rs`, `BigUint` only for
+  wider words like the 1024-bit register file), arithmetic up to 64 bits in an `i128`,
+  and the parameters read once: 10x.
 
 Exactness, on the native engine:
 
@@ -52,6 +66,10 @@ Exactness, on the native engine:
 - The rv32i instruction traces are identical.
 - A 6502 that gets a second driver on RDY halfway, which stops the native engine, gives
   an identical VCD file.
+- The functional 6502 VCD files (also `--signals`) are byte-identical.
+- The rv32 self tests pass on the functional netlist for all four ISAs, with the same
+  instruction traces, and the riscv32 test suite (489 tests, against a reference model,
+  functional and gates) passes in 2 minutes 50 seconds.
 - `pytest` (997 tests), `tools/gui_editor_check.py` and `tools/gui_fuzz.py` pass.
 
 ## Findings
@@ -64,9 +82,12 @@ Exactness, on the native engine:
   buses. With those native, the rv32i gate netlist does 5,500 events and 7,000 cell
   evaluations per cycle in Rust and calls Python about 80 times, for the memory and the
   console of the test bench.
-- **What is left in Python sets the limit.** The functional netlist gains only 1.5x: its
-  cells (adders, registers, comparators in `_yosys_functional.py`) are Python components.
-  Making them native is the next step for it, with values wider than 64 bits.
+- **What is left in Python sets the limit.** With only the gate cells native, the
+  functional netlist gained 1.5x, since its cells were Python components. With them
+  native too it gains 10x.
+- **Native code needs native data.** Unbounded numbers that allocate (`BigUint`) made
+  the functional cells slower than the gates. Words that fit in 64 bits without
+  allocating gave the 10x.
 - **Not everything has to move.** Components in Python (the GUI components, the memory,
   user components) work unchanged and keep the event order exact, so they can move one
   at a time, when they matter for speed.
@@ -87,8 +108,10 @@ The Rust part fits as a separate optional package, `digsim-native`, built with m
 
 ## Not done in the trial
 
-- The functional cells, the tristate buffer, latches and the other flip-flops (`_ALDFF_`,
-  `_DFFSR_`) are Python. A netlist with them still works, those cells are just slower.
+- Some cells are Python: the gate tristate buffer, latches and the other gate flip-flops
+  (`_ALDFF_`, `_DFFSR_`), and the functional `$alu`, `$lcu`, `$fa`, `$macc_v2`, `$lut`,
+  `$sop`, `$bweqx`, `$concat`, `$slice` and `$tribuf`. A netlist with them works, those
+  cells are slower, and functional cells linked as words to one of them stay Python too.
 - After the wires change, the engine stays off until the next `init()`. It could build a
   new engine from the current state instead.
 - The engine state is behind a mutex (the GUI simulates in a thread). Without the GIL
