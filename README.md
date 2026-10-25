@@ -96,6 +96,48 @@ at the same time in another order (buckets per time) would be faster, but gate-l
 designs with races show that order, so it would change their VCD files and could change
 their behavior.
 
+## Not exact: the fast and cycle modes
+
+Opt-in with `DIGSIM_ENGINE`, the exact mode stays the default. They are native only: the
+Python fallback simulates exactly, so a circuit could give other results without the
+native package.
+
+- **`fast`**: the same simulation, with gate delays and glitches, but not the same order
+  of events at the same time. The queue is a bucket for each time, first in first out
+  (`queue.rs`), instead of heapq. An output that keeps its value gets no event, and bus
+  ports get events only while a VCD file is written.
+- **`cycle`**: `fast`, and the gate cells are cycle-based. The combinational gate cells are
+  sorted in levels once. A changed input marks its cell, and one settle event in the time
+  step evaluates the marked cells level by level, with no delay. The flip-flops that a
+  clock edge triggers sample their inputs together before their outputs change, so
+  synchronous designs have no races. Gate cells with a loop (a latch of gates) keep the
+  `fast` mode. Functional cells stay event-driven.
+
+Cycles per second (rv32 self test traces as with the exact mode):
+
+| Design | Python | Exact | Fast | Cycle |
+| --- | ---: | ---: | ---: | ---: |
+| 6502, gates | 977 | 10,208 | 14,996 | 24,322 |
+| 6502, functional | 1,326 | 13,448 | 13,652 | 13,615 |
+| rv32i, gates | 117 | 1,626 | 3,147 | 5,199 |
+| rv32imc, gates | about 30 | 306 | 495 | 3,909 |
+| rv32i, functional | 603 | 6,300 | 6,133 | 6,100 |
+
+- `cycle` gives the most for deep logic: the dividers of rv32imc (1,211 gates deep) ripple
+  and glitch with gate delays, cycle-based each cell is evaluated once. rv32imc gates are
+  13x the exact mode, 130x Python.
+- The functional netlists gain nothing: they have few events and no gate cells.
+- The rv32 self tests (all four ISAs, gates and functional) give the same instruction
+  traces, and the riscv32 suite (489 tests) passes in both modes.
+- What differs, from the DigSim tests: in `fast` the 74193 counter is wrong. Its direction
+  flip-flop is clocked by `Up & Down` and samples `~Up`, and the AND and the NOT change at
+  the same time after `Up`: which one comes first decides what it samples, and only the
+  order of heapq gives the intended count. In `cycle` its gate netlist is right again (the
+  flip-flops sample first), the functional one is still wrong (functional cells are not
+  cycle-based), and a gate output changes at once, not after its delay.
+- In the cycle mode the ports of the gate cells are not in a VCD file, they change without
+  events.
+
 ## Findings
 
 - **Moving only the engine is not enough.** The queue was already C (heapq on float

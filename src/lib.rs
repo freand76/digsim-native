@@ -213,6 +213,11 @@ struct Latest {
     slot: u32,
 }
 
+// The port of the settle event of the cycle-based mode, it has no port
+const SETTLE: u32 = u32::MAX;
+// The level of a flip-flop, it isn't sorted
+const SEQUENTIAL: u32 = u32::MAX;
+
 // The value of an event is a code of a one-bit value (below SLOTS), or a slot in
 // Inner.payloads for other values
 const SLOTS: u32 = 4;
@@ -380,6 +385,19 @@ struct Inner {
     buses: Vec<Bus>,
     words: Vec<word::Cell>,
     heap: queue::Queue,
+    // Not exact (the fast modes): the queue of buckets, and if a VCD file is written
+    exact: bool,
+    fifo: queue::Buckets,
+    recording: bool,
+    // Cycle-based: the combinational gate cells are sorted in levels and evaluated in that
+    // order, with no delay, at a settle event; flip-flops sample their inputs together
+    cycle: bool,
+    cell_level: Vec<u32>,
+    levels: Vec<Vec<u32>>,
+    dirty: Vec<bool>,
+    dirty_comb: usize,
+    dirty_flip_flops: Vec<u32>,
+    settle_pending: bool,
     // The latest event of each port: seq (0 for none), time and value slot
     latest: Vec<Latest>,
     // The values that aren't one bit, with the number of events and latest entries that
@@ -406,7 +424,92 @@ impl Inner {
             self.release(old.slot);
         }
         self.latest[p] = Latest { seq, time, slot };
-        self.heap.push(time, queue::Entry { seq, port, slot });
+        let entry = queue::Entry { seq, port, slot };
+        if self.exact {
+            self.heap.push(time, entry);
+        } else {
+            self.fifo.push(time, entry);
+        }
+    }
+
+    fn push_settle(&mut self) {
+        self.seq += 1;
+        let entry = queue::Entry {
+            seq: self.seq,
+            port: SETTLE,
+            slot: 0,
+        };
+        self.fifo.push(self.time, entry);
+    }
+
+    /// Sort the combinational gate cells in levels, from the flip-flops and the inputs.
+    /// Returns false if they have a loop, they can't be cycle-based then.
+    #[allow(clippy::needless_range_loop)]
+    fn sort_levels(&mut self) -> bool {
+        let count = self.cells.len();
+        let combinational = |cell: &Cell| (cell.kind as u8) < (Kind::Dff as u8);
+        let mut followers: Vec<Vec<u32>> = vec![Vec::new(); count];
+        let mut inputs_left = vec![0u32; count];
+        for c in 0..count {
+            let output = self.cells[c].output as usize;
+            let (start, end) = (
+                self.wired_start[output] as usize,
+                self.wired_start[output + 1] as usize,
+            );
+            for &target in &self.wired_targets[start..end] {
+                let t = target as usize;
+                if self.kind[t] != IN && self.kind[t] != WIRE {
+                    continue;
+                }
+                let follower = self.owner[t] as usize;
+                if combinational(&self.cells[follower]) {
+                    followers[c].push(follower as u32);
+                    if combinational(&self.cells[c]) {
+                        inputs_left[follower] += 1;
+                    }
+                }
+            }
+        }
+        self.cell_level = vec![SEQUENTIAL; count];
+        let mut ready: Vec<u32> = Vec::new();
+        let mut combinational_count = 0;
+        for c in 0..count {
+            if combinational(&self.cells[c]) {
+                combinational_count += 1;
+                if inputs_left[c] == 0 {
+                    self.cell_level[c] = 0;
+                    ready.push(c as u32);
+                }
+            }
+        }
+        let mut sorted = 0;
+        let mut max_level = 0;
+        while let Some(c) = ready.pop() {
+            sorted += 1;
+            let level = self.cell_level[c as usize];
+            max_level = max_level.max(level);
+            if !combinational(&self.cells[c as usize]) {
+                continue;
+            }
+            for &follower in &followers[c as usize] {
+                let f = follower as usize;
+                let next = level + 1;
+                if self.cell_level[f] == SEQUENTIAL || self.cell_level[f] < next {
+                    self.cell_level[f] = next;
+                }
+                inputs_left[f] -= 1;
+                if inputs_left[f] == 0 {
+                    ready.push(follower);
+                }
+            }
+        }
+        if sorted < combinational_count {
+            self.cell_level = vec![SEQUENTIAL; count];
+            return false;
+        }
+        self.levels = vec![Vec::new(); max_level as usize + 1];
+        self.dirty = vec![false; count];
+        true
     }
 
     fn allocate(&mut self, value: Value, count: u32) -> u32 {
@@ -695,11 +798,18 @@ impl<'a, 'py> Ctx<'a, 'py> {
         let p = port as usize;
         match self.st().kind[p] {
             IN => {
-                if value != self.st().value[p] {
+                let changed = value != self.st().value[p];
+                if changed {
                     self.update_wires(port, value)?;
                 }
                 let cell = self.st().owner[p] as usize;
-                self.evaluate(cell);
+                if self.st().cycle {
+                    if changed {
+                        self.mark(cell);
+                    }
+                } else {
+                    self.evaluate(cell);
+                }
             }
             WIRE => {
                 if value != self.st().value[p] {
@@ -793,7 +903,7 @@ impl<'a, 'py> Ctx<'a, 'py> {
             if bit == X {
                 if st.buses[bus].value != BusValue::Code(X) {
                     self.update_bus_wires(port, BusValue::Code(X))?;
-                    self.st().push(port, Value::Bus(BusValue::Code(X)), 0);
+                    self.bus_event(port, BusValue::Code(X));
                 }
                 return Ok(());
             }
@@ -807,12 +917,12 @@ impl<'a, 'py> Ctx<'a, 'py> {
             let bus_value = BusValue::Code(if not_driven == count { Z } else { X });
             if self.st().buses[bus].value != bus_value {
                 self.update_bus_wires(port, bus_value)?;
-                self.st().push(port, Value::Bus(bus_value), 0);
+                self.bus_event(port, bus_value);
             }
             return Ok(());
         }
         self.update_bus_wires(port, BusValue::Int(value))?;
-        self.st().push(port, Value::Bus(BusValue::Int(value)), 0);
+        self.bus_event(port, BusValue::Int(value));
         Ok(())
     }
 
@@ -822,7 +932,100 @@ impl<'a, 'py> Ctx<'a, 'py> {
         if let Some(out) = st.evaluate(cell) {
             let output = st.cells[cell].output;
             let delay = st.delay[output as usize];
+            // Fast: no event for an output that keeps its value and has no event coming
+            if !st.exact && st.value[output as usize] == out && st.latest[output as usize].seq == 0
+            {
+                return;
+            }
             st.push(output, Value::Bit(out), delay);
+        }
+    }
+
+    // Cycle-based: set a cell output now. An event it has coming (like the 0 of a
+    // flip-flop's default state) becomes stale, as a newer event makes it.
+    fn drive(&mut self, output: u32, value: u8) -> PyResult<()> {
+        let st = self.st();
+        let latest = st.latest[output as usize];
+        if latest.seq != 0 {
+            st.latest[output as usize].seq = 0;
+            st.release(latest.slot);
+        }
+        self.update_wires(output, value)
+    }
+
+    // Cycle-based: a cell to evaluate at the settle event
+    fn mark(&mut self, cell: usize) {
+        let st = self.st();
+        if st.dirty[cell] {
+            return;
+        }
+        st.dirty[cell] = true;
+        let level = st.cell_level[cell];
+        if level == SEQUENTIAL {
+            st.dirty_flip_flops.push(cell as u32);
+        } else {
+            st.levels[level as usize].push(cell as u32);
+            st.dirty_comb += 1;
+        }
+        if !st.settle_pending {
+            st.settle_pending = true;
+            st.push_settle();
+        }
+    }
+
+    // Cycle-based: the flip-flops that were triggered sample their inputs together and
+    // then change, and the combinational cells are evaluated level by level, until
+    // nothing changes
+    fn settle(&mut self) -> PyResult<()> {
+        for _round in 0..10_000 {
+            let st = self.st();
+            if !st.dirty_flip_flops.is_empty() {
+                let flip_flops = std::mem::take(&mut st.dirty_flip_flops);
+                let mut outputs = Vec::new();
+                for &c in &flip_flops {
+                    let c = c as usize;
+                    st.dirty[c] = false;
+                    st.stats[4] += 1;
+                    if let Some(value) = st.evaluate(c) {
+                        outputs.push((st.cells[c].output, value));
+                    }
+                }
+                for (output, value) in outputs {
+                    self.drive(output, value)?;
+                }
+            }
+            let mut level = 0;
+            while level < self.st().levels.len() {
+                loop {
+                    let st = self.st();
+                    let Some(c) = st.levels[level].pop() else {
+                        break;
+                    };
+                    let c = c as usize;
+                    st.dirty[c] = false;
+                    st.dirty_comb -= 1;
+                    st.stats[4] += 1;
+                    if let Some(value) = st.evaluate(c) {
+                        let output = st.cells[c].output;
+                        self.drive(output, value)?;
+                    }
+                }
+                level += 1;
+            }
+            let st = self.st();
+            if st.dirty_flip_flops.is_empty() && st.dirty_comb == 0 {
+                break;
+            }
+        }
+        self.st().settle_pending = false;
+        Ok(())
+    }
+
+    // The event of a bus port, for the VCD file: not in the fast modes without one
+    fn bus_event(&mut self, port: u32, value: BusValue) {
+        let st = self.st();
+        if st.exact || st.recording {
+            st.push(port, Value::Bus(value), 0);
         }
     }
 
@@ -891,9 +1094,23 @@ impl<'a, 'py> Ctx<'a, 'py> {
         loop {
             let py = self.py;
             let st = self.st();
-            let Some((time, event)) = st.heap.pop() else {
+            let popped = if st.exact {
+                st.heap.pop()
+            } else {
+                // No putting back, that would change the order of the bucket
+                match st.fifo.peek_time() {
+                    Some(time) if stop_time.is_some_and(|stop| time > stop) => return Ok(None),
+                    _ => st.fifo.pop(),
+                }
+            };
+            let Some((time, event)) = popped else {
                 return Ok(None);
             };
+            if event.port == SETTLE {
+                st.time = time;
+                self.settle()?;
+                return Ok(Some(SETTLE));
+            }
             let p = event.port as usize;
             let latest = st.latest[p];
             let valid = latest.seq != 0
@@ -966,6 +1183,7 @@ impl Engine {
         aux: Vec<u32>,
         words: Vec<WordCellArgs>,
         time: i64,
+        mode: u8,
     ) -> PyResult<Self> {
         let mut wired_start = Vec::with_capacity(wired.len() + 1);
         let mut wired_targets = Vec::new();
@@ -1050,7 +1268,7 @@ impl Engine {
             PyString::intern(py, "X").into_any().unbind(),
             PyString::intern(py, "Z").into_any().unbind(),
         ];
-        Ok(Engine {
+        let engine = Engine {
             inner: lock::Lock::new(Inner {
                 time,
                 seq: 0,
@@ -1067,6 +1285,16 @@ impl Engine {
                 buses: native_buses,
                 words: word_cells,
                 heap: queue::Queue::default(),
+                exact: mode == 0,
+                fifo: queue::Buckets::default(),
+                recording: false,
+                cycle: false,
+                cell_level: Vec::new(),
+                levels: Vec::new(),
+                dirty: Vec::new(),
+                dirty_comb: 0,
+                dirty_flip_flops: Vec::new(),
+                settle_pending: false,
                 latest: vec![Latest::default(); count],
                 payloads: Vec::new(),
                 free: Vec::new(),
@@ -1074,7 +1302,27 @@ impl Engine {
             }),
             ports: lock::Lock::new(ports),
             values: objects,
-        })
+        };
+        if mode == 2 {
+            let mut st = engine.inner.lock();
+            st.cycle = st.sort_levels();
+        }
+        Ok(engine)
+    }
+
+    /// Evaluate the cells a settle event would, before going back to Python
+    fn settle(&self, py: Python<'_>) -> PyResult<()> {
+        let mut ctx = Ctx::new(py, self);
+        if ctx.st().settle_pending {
+            ctx.settle()?;
+        }
+        Ok(())
+    }
+
+    /// If the gate cells are cycle-based (in the cycle mode, unless they have a loop)
+    #[getter]
+    fn cycle_based(&self) -> bool {
+        self.inner.lock().cycle
     }
 
     #[getter]
@@ -1144,13 +1392,14 @@ impl Engine {
         vcd: Option<Bound<'_, PyAny>>,
     ) -> PyResult<bool> {
         let mut ctx = Ctx::new(py, self);
+        ctx.st().recording = vcd.is_some();
         let mut stop_time = stop_time;
         let mut single_step_stop = false;
         while ctx.st().time <= stop_time {
             let Some(port) = ctx.process(Some(stop_time), &vcd)? else {
                 break;
             };
-            if single_step && ctx.st().toplevel[port as usize] {
+            if single_step && port != SETTLE && ctx.st().toplevel[port as usize] {
                 stop_time = ctx.st().time;
                 single_step_stop = true;
             }
@@ -1167,9 +1416,10 @@ impl Engine {
         vcd: Option<Bound<'_, PyAny>>,
     ) -> PyResult<(bool, bool)> {
         let mut ctx = Ctx::new(py, self);
+        ctx.st().recording = vcd.is_some();
         Ok(match ctx.process(stop_time, &vcd)? {
             None => (false, false),
-            Some(port) => (true, ctx.st().toplevel[port as usize]),
+            Some(port) => (true, port != SETTLE && ctx.st().toplevel[port as usize]),
         })
     }
 
@@ -1206,8 +1456,16 @@ impl Engine {
         Vec<Bound<'py, PyAny>>,
     )> {
         let st = self.inner.lock();
-        let mut events = Vec::with_capacity(st.heap.len());
-        for (time, e) in st.heap.iter() {
+        let mut events = Vec::with_capacity(st.heap.len() + st.fifo.len());
+        let all: Vec<(i64, queue::Entry)> = if st.exact {
+            st.heap.iter().map(|(t, e)| (t, *e)).collect()
+        } else {
+            st.fifo.iter().map(|(t, e)| (t, *e)).collect()
+        };
+        for (time, e) in all {
+            if e.port == SETTLE {
+                continue;
+            }
             let value = st.slot_value(py, e.slot);
             events.push((time, e.seq, e.port, self.object(py, &value)?));
         }
@@ -1267,7 +1525,8 @@ impl Engine {
     }
 
     fn __len__(&self) -> usize {
-        self.inner.lock().heap.len()
+        let st = self.inner.lock();
+        st.heap.len() + st.fifo.len()
     }
 
     /// Events (native, Python), stale events, Python calls and cell evaluations so far
