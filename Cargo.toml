@@ -1,0 +1,17 @@
+[package]
+name = "digsim-native"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "digsim_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+# abi3: one build per platform works on every Python from 3.11
+pyo3 = { version = "0.28.3", features = ["extension-module", "abi3-py311"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
