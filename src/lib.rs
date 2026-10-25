@@ -15,9 +15,11 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyInt, PyString};
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 
 mod bits;
+mod lock;
+mod queue;
 mod word;
 use num_bigint::{BigInt, BigUint};
 
@@ -203,18 +205,17 @@ impl Value {
     }
 }
 
-struct Event {
-    time: i64,
+/// The latest event of a port: seq (0 for none), time and value slot
+#[derive(Clone, Copy, Default)]
+struct Latest {
     seq: u64,
-    port: u32,
-    value: Value,
+    time: i64,
+    slot: u32,
 }
 
-impl Timed for Event {
-    fn time(&self) -> i64 {
-        self.time
-    }
-}
+// The value of an event is a code of a one-bit value (below SLOTS), or a slot in
+// Inner.payloads for other values
+const SLOTS: u32 = 4;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -281,7 +282,8 @@ const KINDS: [Kind; 26] = {
 struct Cell {
     kind: Kind,
     // The input ports, in the order of the kind; flip-flops: C, D, E, R
-    inputs: Vec<u32>,
+    // The first of the input ports in Inner.cell_inputs
+    first: u32,
     output: u32,
     clock_edge: u8,
     reset_level: u8,
@@ -367,39 +369,103 @@ struct Inner {
     // of a word port
     aux: Vec<u32>,
     value: Vec<u8>,
-    wired: Vec<Vec<u32>>,
+    // The ports each port drives: wired_targets[wired_start[p]..wired_start[p + 1]]
+    wired_start: Vec<u32>,
+    wired_targets: Vec<u32>,
     delay: Vec<i64>,
     toplevel: Vec<bool>,
     cells: Vec<Cell>,
+    // The input ports of the cells, in the order of each kind; flip-flops: C, D, E, R
+    cell_inputs: Vec<u32>,
     buses: Vec<Bus>,
     words: Vec<word::Cell>,
-    heap: Vec<Event>,
-    latest: Vec<Option<(u64, i64, Value)>>,
+    heap: queue::Queue,
+    // The latest event of each port: seq (0 for none), time and value slot
+    latest: Vec<Latest>,
+    // The values that aren't one bit, with the number of events and latest entries that
+    // have them, and the free slots
+    payloads: Vec<(Value, u32)>,
+    free: Vec<u32>,
     // Statistics: events (native, Python), stale events, Python calls, cell evaluations
     stats: [u64; 5],
 }
 
 impl Inner {
-    fn push(&mut self, py: Python<'_>, port: u32, value: Value, delay: i64) {
+    fn push(&mut self, port: u32, value: Value, delay: i64) {
         let time = self.time + delay;
         self.seq += 1;
         let seq = self.seq;
-        self.latest[port as usize] = Some((seq, time, value.clone_ref(py)));
-        heappush(
-            &mut self.heap,
-            Event {
-                time,
-                seq,
-                port,
-                value,
-            },
-        );
+        let slot = match value {
+            Value::Bit(code) => code as u32,
+            // The event and the latest entry
+            other => self.allocate(other, 2),
+        };
+        let p = port as usize;
+        let old = self.latest[p];
+        if old.seq != 0 {
+            self.release(old.slot);
+        }
+        self.latest[p] = Latest { seq, time, slot };
+        self.heap.push(time, queue::Entry { seq, port, slot });
+    }
+
+    fn allocate(&mut self, value: Value, count: u32) -> u32 {
+        match self.free.pop() {
+            Some(index) => {
+                self.payloads[index as usize] = (value, count);
+                index + SLOTS
+            }
+            None => {
+                self.payloads.push((value, count));
+                self.payloads.len() as u32 - 1 + SLOTS
+            }
+        }
+    }
+
+    fn release(&mut self, slot: u32) {
+        if slot < SLOTS {
+            return;
+        }
+        let index = slot - SLOTS;
+        let entry = &mut self.payloads[index as usize];
+        entry.1 -= 1;
+        if entry.1 == 0 {
+            entry.0 = Value::Bit(0);
+            self.free.push(index);
+        }
+    }
+
+    fn slot_value(&self, py: Python<'_>, slot: u32) -> Value {
+        if slot < SLOTS {
+            Value::Bit(slot as u8)
+        } else {
+            self.payloads[(slot - SLOTS) as usize].0.clone_ref(py)
+        }
+    }
+
+    /// Do two slots have the same value
+    fn same(&self, py: Python<'_>, a: u32, b: u32) -> PyResult<bool> {
+        if a == b {
+            return Ok(true);
+        }
+        if a < SLOTS || b < SLOTS {
+            return Ok(false);
+        }
+        let a = &self.payloads[(a - SLOTS) as usize].0;
+        let b = &self.payloads[(b - SLOTS) as usize].0;
+        Ok(match (a, b) {
+            (Value::Bus(a), Value::Bus(b)) => a == b,
+            (Value::Word(a), Value::Word(b)) => a == b,
+            (Value::Python(a), Value::Python(b)) => a.bind(py).eq(b.bind(py))?,
+            _ => false,
+        })
     }
 
     /// The new output of a cell, None if it doesn't set it (a flip-flop without an edge)
     fn evaluate(&mut self, c: usize) -> Option<u8> {
         let cell = &mut self.cells[c];
-        let v = |i: usize| self.value[cell.inputs[i] as usize];
+        let inputs = &self.cell_inputs[cell.first as usize..];
+        let v = |i: usize| self.value[inputs[i] as usize];
         use Kind::*;
         let out = match cell.kind {
             Buf => v(0),
@@ -515,15 +581,15 @@ type WordCellArgs = (
 /// The simulation of a circuit, see digsim/circuit/_native.py
 #[pyclass(frozen)]
 struct Engine {
-    inner: Mutex<Inner>,
-    ports: Mutex<Vec<Py<PyAny>>>,
+    inner: lock::Lock<Inner>,
+    ports: lock::Lock<Vec<Py<PyAny>>>,
     // The Python objects of the values 0, 1, "X" and "Z"
     values: [Py<PyAny>; 4],
 }
 
 impl Engine {
     fn port<'py>(&self, py: Python<'py>, p: usize) -> Bound<'py, PyAny> {
-        self.ports.lock().unwrap()[p].bind(py).clone()
+        self.ports.lock()[p].bind(py).clone()
     }
 
     fn bus_object<'py>(&self, py: Python<'py>, value: BusValue) -> PyResult<Bound<'py, PyAny>> {
@@ -579,7 +645,7 @@ fn bus_to_bit(value: BusValue) -> u8 {
 struct Ctx<'a, 'py> {
     py: Python<'py>,
     engine: &'a Engine,
-    guard: Option<MutexGuard<'a, Inner>>,
+    guard: Option<lock::Guard<'a, Inner>>,
 }
 
 impl<'a, 'py> Ctx<'a, 'py> {
@@ -587,7 +653,7 @@ impl<'a, 'py> Ctx<'a, 'py> {
         Ctx {
             py,
             engine,
-            guard: Some(engine.inner.lock().unwrap()),
+            guard: Some(engine.inner.lock()),
         }
     }
 
@@ -604,7 +670,7 @@ impl<'a, 'py> Ctx<'a, 'py> {
         let result = engine
             .port(self.py, port as usize)
             .call_method1(intern!(self.py, "set_value"), (value,));
-        self.guard = Some(engine.inner.lock().unwrap());
+        self.guard = Some(engine.inner.lock());
         result.map(|_| ())
     }
 
@@ -616,9 +682,9 @@ impl<'a, 'py> Ctx<'a, 'py> {
             return Ok(());
         }
         st.value[p] = value;
-        let count = st.wired[p].len();
-        for i in 0..count {
-            let target = self.st().wired[p][i];
+        let (start, end) = (st.wired_start[p] as usize, st.wired_start[p + 1] as usize);
+        for i in start..end {
+            let target = self.st().wired_targets[i];
             self.set_value(target, value)?;
         }
         Ok(())
@@ -700,9 +766,9 @@ impl<'a, 'py> Ctx<'a, 'py> {
             return Ok(());
         }
         st.buses[bus].value = value;
-        let count = st.wired[p].len();
-        for i in 0..count {
-            let target = self.st().wired[p][i];
+        let (start, end) = (st.wired_start[p] as usize, st.wired_start[p + 1] as usize);
+        for i in start..end {
+            let target = self.st().wired_targets[i];
             match self.st().kind[target as usize] {
                 BUS => self.set_bus(target, value)?,
                 PY => {
@@ -717,7 +783,6 @@ impl<'a, 'py> Ctx<'a, 'py> {
 
     // PortMultiBitWire.update_value_from_bits()
     fn update_value_from_bits(&mut self, port: u32) -> PyResult<()> {
-        let py = self.py;
         let st = self.st();
         let bus = st.owner[port as usize] as usize;
         let mut value = 0u64;
@@ -728,7 +793,7 @@ impl<'a, 'py> Ctx<'a, 'py> {
             if bit == X {
                 if st.buses[bus].value != BusValue::Code(X) {
                     self.update_bus_wires(port, BusValue::Code(X))?;
-                    self.st().push(py, port, Value::Bus(BusValue::Code(X)), 0);
+                    self.st().push(port, Value::Bus(BusValue::Code(X)), 0);
                 }
                 return Ok(());
             }
@@ -742,40 +807,37 @@ impl<'a, 'py> Ctx<'a, 'py> {
             let bus_value = BusValue::Code(if not_driven == count { Z } else { X });
             if self.st().buses[bus].value != bus_value {
                 self.update_bus_wires(port, bus_value)?;
-                self.st().push(py, port, Value::Bus(bus_value), 0);
+                self.st().push(port, Value::Bus(bus_value), 0);
             }
             return Ok(());
         }
         self.update_bus_wires(port, BusValue::Int(value))?;
-        self.st()
-            .push(py, port, Value::Bus(BusValue::Int(value)), 0);
+        self.st().push(port, Value::Bus(BusValue::Int(value)), 0);
         Ok(())
     }
 
     fn evaluate(&mut self, cell: usize) {
-        let py = self.py;
         let st = self.st();
         st.stats[4] += 1;
         if let Some(out) = st.evaluate(cell) {
             let output = st.cells[cell].output;
             let delay = st.delay[output as usize];
-            st.push(py, output, Value::Bit(out), delay);
+            st.push(output, Value::Bit(out), delay);
         }
     }
 
     // The events of a functional cell
     fn push_writes(&mut self, writes: Vec<word::Write>) {
-        let py = self.py;
         let st = self.st();
         for write in writes {
             match write {
                 word::Write::Bit(port, code) => {
                     let delay = st.delay[port as usize];
-                    st.push(py, port, Value::Bit(code), delay);
+                    st.push(port, Value::Bit(code), delay);
                 }
                 word::Write::Word(port, value) => {
                     let delay = st.delay[port as usize];
-                    st.push(py, port, Value::Word(value), delay);
+                    st.push(port, Value::Word(value), delay);
                 }
             }
         }
@@ -829,35 +891,29 @@ impl<'a, 'py> Ctx<'a, 'py> {
         loop {
             let py = self.py;
             let st = self.st();
-            let Some(event) = heappop(&mut st.heap) else {
+            let Some((time, event)) = st.heap.pop() else {
                 return Ok(None);
             };
             let p = event.port as usize;
-            let valid = match &st.latest[p] {
-                None => false,
-                Some((seq, time, value)) => {
-                    *seq == event.seq
-                        || (*time == event.time
-                            && match (value, &event.value) {
-                                (Value::Bit(a), Value::Bit(b)) => a == b,
-                                (Value::Bus(a), Value::Bus(b)) => a == b,
-                                (Value::Word(a), Value::Word(b)) => a == b,
-                                (Value::Python(a), Value::Python(b)) => a.bind(py).eq(b.bind(py))?,
-                                _ => false,
-                            })
-                }
-            };
+            let latest = st.latest[p];
+            let valid = latest.seq != 0
+                && (latest.seq == event.seq
+                    || (latest.time == time && st.same(py, latest.slot, event.slot)?));
             if !valid {
                 st.stats[2] += 1;
+                st.release(event.slot);
                 continue;
             }
-            if stop_time.is_some_and(|stop| event.time > stop) {
-                heappush(&mut st.heap, event);
+            if stop_time.is_some_and(|stop| time > stop) {
+                st.heap.push(time, event);
                 return Ok(None);
             }
-            st.latest[p] = None;
-            st.time = event.time;
-            match event.value {
+            st.latest[p].seq = 0;
+            st.release(latest.slot);
+            st.time = time;
+            let value = st.slot_value(py, event.slot);
+            st.release(event.slot);
+            match value {
                 Value::Bit(value) => {
                     st.stats[0] += 1;
                     self.update_wires(event.port, value)?
@@ -875,7 +931,7 @@ impl<'a, 'py> Ctx<'a, 'py> {
                     let result = engine
                         .port(py, p)
                         .call_method1(intern!(py, "delta_cycle"), (value.bind(py),));
-                    self.guard = Some(engine.inner.lock().unwrap());
+                    self.guard = Some(engine.inner.lock());
                     result?;
                 }
             }
@@ -884,7 +940,7 @@ impl<'a, 'py> Ctx<'a, 'py> {
                 let engine = self.engine;
                 self.guard = None;
                 let result = vcd.call_method1(intern!(py, "write"), (engine.port(py, p), time));
-                self.guard = Some(engine.inner.lock().unwrap());
+                self.guard = Some(engine.inner.lock());
                 result?;
             }
             return Ok(Some(event.port));
@@ -911,6 +967,13 @@ impl Engine {
         words: Vec<WordCellArgs>,
         time: i64,
     ) -> PyResult<Self> {
+        let mut wired_start = Vec::with_capacity(wired.len() + 1);
+        let mut wired_targets = Vec::new();
+        for targets in &wired {
+            wired_start.push(wired_targets.len() as u32);
+            wired_targets.extend_from_slice(targets);
+        }
+        wired_start.push(wired_targets.len() as u32);
         let mut word_cells = Vec::with_capacity(words.len());
         for (kind, inputs, outputs, params, q, old_clock) in words {
             let kind = *word::KINDS.get(kind as usize).ok_or_else(|| {
@@ -958,12 +1021,13 @@ impl Engine {
         }
         let count = ports.len();
         let mut native_cells = Vec::with_capacity(cells.len());
+        let mut cell_inputs = Vec::new();
         for (kind, inputs, output, levels, old_clock) in cells {
             native_cells.push(Cell {
                 kind: *KINDS
                     .get(kind as usize)
                     .ok_or_else(|| PyValueError::new_err(format!("Unknown cell kind {kind}")))?,
-                inputs,
+                first: cell_inputs.len() as u32,
                 output,
                 clock_edge: levels[0],
                 reset_level: levels[1],
@@ -971,6 +1035,7 @@ impl Engine {
                 enable_level: levels[3],
                 old_clock,
             });
+            cell_inputs.extend_from_slice(&inputs);
         }
         let mut native_buses = Vec::with_capacity(buses.len());
         for (bits, value) in buses {
@@ -986,41 +1051,45 @@ impl Engine {
             PyString::intern(py, "Z").into_any().unbind(),
         ];
         Ok(Engine {
-            inner: Mutex::new(Inner {
+            inner: lock::Lock::new(Inner {
                 time,
                 seq: 0,
                 kind: kinds,
                 owner: owners,
                 aux,
                 value: values,
-                wired,
+                wired_start,
+                wired_targets,
                 delay: delays,
                 toplevel,
                 cells: native_cells,
+                cell_inputs,
                 buses: native_buses,
                 words: word_cells,
-                heap: Vec::new(),
-                latest: (0..count).map(|_| None).collect(),
+                heap: queue::Queue::default(),
+                latest: vec![Latest::default(); count],
+                payloads: Vec::new(),
+                free: Vec::new(),
                 stats: [0; 5],
             }),
-            ports: Mutex::new(ports),
+            ports: lock::Lock::new(ports),
             values: objects,
         })
     }
 
     #[getter]
     fn time(&self) -> i64 {
-        self.inner.lock().unwrap().time
+        self.inner.lock().time
     }
 
     #[setter]
     fn set_time(&self, time: i64) {
-        self.inner.lock().unwrap().time = time;
+        self.inner.lock().time = time;
     }
 
     /// The value of a native port, as a Python object
     fn value<'py>(&self, py: Python<'py>, nid: u32) -> PyResult<Bound<'py, PyAny>> {
-        let st = self.inner.lock().unwrap();
+        let st = self.inner.lock();
         let p = nid as usize;
         if st.kind[p] == BUS {
             self.bus_object(py, st.buses[st.owner[p] as usize].value)
@@ -1031,7 +1100,7 @@ impl Engine {
 
     /// Set the value of a native port, without updating anything (Port._value = value)
     fn set_raw(&self, nid: u32, value: Bound<'_, PyAny>) -> PyResult<()> {
-        let mut st = self.inner.lock().unwrap();
+        let mut st = self.inner.lock();
         let p = nid as usize;
         if st.kind[p] == BUS {
             let bus = st.owner[p] as usize;
@@ -1043,21 +1112,15 @@ impl Engine {
     }
 
     /// Circuit.add_event() for a port of the engine
-    fn add_event(
-        &self,
-        py: Python<'_>,
-        nid: u32,
-        value: Bound<'_, PyAny>,
-        delay: i64,
-    ) -> PyResult<()> {
-        let mut st = self.inner.lock().unwrap();
+    fn add_event(&self, nid: u32, value: Bound<'_, PyAny>, delay: i64) -> PyResult<()> {
+        let mut st = self.inner.lock();
         let value = match st.kind[nid as usize] {
             PY => Value::Python(value.unbind()),
             BUS => Value::Bus(bus_value(&value)?),
             WORD => Value::Word(bits::Bits::from(value.extract::<BigUint>()?)),
             _ => Value::Bit(bit_code(&value)?),
         };
-        st.push(py, nid, value, delay);
+        st.push(nid, value, delay);
         Ok(())
     }
 
@@ -1113,17 +1176,20 @@ impl Engine {
     /// Add a Python port that the engine didn't get, like an internal port of a
     /// component. Returns its index.
     fn add_port(&self, port: Py<PyAny>, wired: Vec<u32>, toplevel: bool) -> u32 {
-        let mut st = self.inner.lock().unwrap();
+        let mut st = self.inner.lock();
         let nid = st.kind.len() as u32;
         st.kind.push(PY);
         st.owner.push(u32::MAX);
         st.aux.push(0);
         st.value.push(X);
-        st.wired.push(wired);
+        // Ports are added after the others, so their targets go at the end
+        st.wired_targets.extend_from_slice(&wired);
+        let end = st.wired_targets.len() as u32;
+        st.wired_start.push(end);
         st.delay.push(0);
         st.toplevel.push(toplevel);
-        st.latest.push(None);
-        self.ports.lock().unwrap().push(port);
+        st.latest.push(Latest::default());
+        self.ports.lock().push(port);
         nid
     }
 
@@ -1139,12 +1205,17 @@ impl Engine {
         Vec<Option<u64>>,
         Vec<Bound<'py, PyAny>>,
     )> {
-        let st = self.inner.lock().unwrap();
+        let st = self.inner.lock();
         let mut events = Vec::with_capacity(st.heap.len());
-        for e in &st.heap {
-            events.push((e.time, e.seq, e.port, self.object(py, &e.value)?));
+        for (time, e) in st.heap.iter() {
+            let value = st.slot_value(py, e.slot);
+            events.push((time, e.seq, e.port, self.object(py, &value)?));
         }
-        let latest = st.latest.iter().map(|l| l.as_ref().map(|l| l.0)).collect();
+        let latest = st
+            .latest
+            .iter()
+            .map(|l| (l.seq != 0).then_some(l.seq))
+            .collect();
         let clocks = st
             .cells
             .iter()
@@ -1175,7 +1246,7 @@ impl Engine {
         (BigUint, BigUint),
         Bound<'py, PyAny>,
     )> {
-        let st = self.inner.lock().unwrap();
+        let st = self.inner.lock();
         st.words
             .iter()
             .map(|cell| {
@@ -1196,12 +1267,12 @@ impl Engine {
     }
 
     fn __len__(&self) -> usize {
-        self.inner.lock().unwrap().heap.len()
+        self.inner.lock().heap.len()
     }
 
     /// Events (native, Python), stale events, Python calls and cell evaluations so far
     fn stats(&self) -> [u64; 5] {
-        self.inner.lock().unwrap().stats
+        self.inner.lock().stats
     }
 }
 

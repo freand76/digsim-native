@@ -72,6 +72,30 @@ Exactness, on the native engine:
   functional and gates) passes in 2 minutes 50 seconds.
 - `pytest` (997 tests), `tools/gui_editor_check.py` and `tools/gui_fuzz.py` pass.
 
+### Tuning the engine
+
+On rv32i gates, the engine itself took most of the time, about 90 ns per event. Measured
+with the native engine, cycles per second:
+
+| Step | rv32i gates | rv32i functional | 6502 gates |
+| --- | ---: | ---: | ---: |
+| Before | 1,215 | 5,907 | 9,643 |
+| A lock without atomics instead of a mutex (`lock.rs`, the GIL serializes) | 1,470 | 6,310 | 9,400 |
+| 24-byte events, values in a slab, flat fan-out lists | 1,710 | 6,470 | 10,650 |
+| Moving a hole in the heap instead of swapping | 1,690 | 6,470 | |
+| The heap times in an array of their own (reverted, slower) | 1,550 | | |
+| One array for the latest events, flat cell inputs | 1,700 | 6,320 | 10,430 |
+
+1.4x on gate netlists, little on functional ones (they have few events). What is left of
+the engine time on rv32i gates: the heap about 40%, Python components 20% (the memory of
+the test bench), the gates 15%, and the rest the fan-out, the stale events and the
+dispatch. The heap must be CPython's heapq, step by step, to keep the order of events at
+the same time, and its cost is in the algorithm (a pop goes down to a leaf, through about
+12 levels of a heap of 5,000 events), not in the memory layout. A queue that keeps events
+at the same time in another order (buckets per time) would be faster, but gate-level
+designs with races show that order, so it would change their VCD files and could change
+their behavior.
+
 ## Findings
 
 - **Moving only the engine is not enough.** The queue was already C (heapq on float
