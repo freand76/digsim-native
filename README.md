@@ -7,15 +7,17 @@ it, and simulates in Python as before when it can't.
 ```sh
 native/build.sh                     # build the wheel and install it into ../.venv
 DIGSIM_ENGINE=python uv run ...     # the Python engine (also without the package)
-DIGSIM_ENGINE=queue uv run ...      # trial 1: only the event queue is native
-DIGSIM_ENGINE=native uv run ...     # trial 2: the native engine (the default)
+uv run ...                          # the native engine, when it is installed
 ```
+
+There are two engines, Python and native, and they give the same results: the same order
+of events, the same output and byte-identical VCD files. The native engine is only faster.
 
 ## The two trials
 
-**Trial 1, only the engine** (`EventQueue`): the event queue and the check for stale
-events in Rust, the loop, the ports and all components in Python. The queue is CPython's
-heapq algorithm step by step, so events at the same time keep their order.
+**Trial 1, only the engine** (removed): the event queue and the check for stale events in
+Rust, the loop, the ports and all components in Python. The queue is CPython's heapq
+algorithm step by step, so events at the same time keep their order.
 
 **Trial 2, the circuit handling too** (`Engine`): Rust runs the event loop, and simulates
 the Yosys gate cells (the gates, muxes and the D flip-flops with reset and enable), the
@@ -96,47 +98,25 @@ at the same time in another order (buckets per time) would be faster, but gate-l
 designs with races show that order, so it would change their VCD files and could change
 their behavior.
 
-## Not exact: the fast and cycle modes
+## Not exact modes (tried and removed)
 
-Opt-in with `DIGSIM_ENGINE`, the exact mode stays the default. They are native only: the
-Python fallback simulates exactly, so a circuit could give other results without the
-native package.
+Two modes that give up the exact order were tried, as `DIGSIM_ENGINE=fast` and `cycle`:
 
-- **`fast`**: the same simulation, with gate delays and glitches, but not the same order
-  of events at the same time. The queue is a bucket for each time, first in first out
-  (`queue.rs`), instead of heapq. An output that keeps its value gets no event, and bus
-  ports get events only while a VCD file is written.
-- **`cycle`**: `fast`, and the gate cells are cycle-based. The combinational gate cells are
-  sorted in levels once. A changed input marks its cell, and one settle event in the time
-  step evaluates the marked cells level by level, with no delay. The flip-flops that a
-  clock edge triggers sample their inputs together before their outputs change, so
-  synchronous designs have no races. Gate cells with a loop (a latch of gates) keep the
-  `fast` mode. Functional cells stay event-driven.
+- `fast`: a first in first out queue for each time instead of heapq, and no event for an
+  output that keeps its value. 1.5x to 2x the exact engine on gate netlists.
+- `cycle`: the gate cells of a netlist sorted in levels and evaluated once per time step
+  with no delay, the flip-flops sampling together. 2.4x on the 6502 gates, 13x on the
+  rv32imc gates (their dividers ripple and glitch with gate delays).
+- Neither helps a functional netlist, it has few events.
 
-Cycles per second (rv32 self test traces as with the exact mode):
+They were left out:
 
-| Design | Python | Exact | Fast | Cycle |
-| --- | ---: | ---: | ---: | ---: |
-| 6502, gates | 977 | 10,208 | 14,996 | 24,322 |
-| 6502, functional | 1,326 | 13,448 | 13,652 | 13,615 |
-| rv32i, gates | 117 | 1,626 | 3,147 | 5,199 |
-| rv32imc, gates | about 30 | 306 | 495 | 3,909 |
-| rv32i, functional | 603 | 6,300 | 6,133 | 6,100 |
-
-- `cycle` gives the most for deep logic: the dividers of rv32imc (1,211 gates deep) ripple
-  and glitch with gate delays, cycle-based each cell is evaluated once. rv32imc gates are
-  13x the exact mode, 130x Python.
-- The functional netlists gain nothing: they have few events and no gate cells.
-- The rv32 self tests (all four ISAs, gates and functional) give the same instruction
-  traces, and the riscv32 suite (489 tests) passes in both modes.
-- What differs, from the DigSim tests: in `fast` the 74193 counter is wrong. Its direction
-  flip-flop is clocked by `Up & Down` and samples `~Up`, and the AND and the NOT change at
-  the same time after `Up`: which one comes first decides what it samples, and only the
-  order of heapq gives the intended count. In `cycle` its gate netlist is right again (the
-  flip-flops sample first), the functional one is still wrong (functional cells are not
-  cycle-based), and a gate output changes at once, not after its delay.
-- In the cycle mode the ports of the gate cells are not in a VCD file, they change without
-  events.
+- Only the native engine has them, so a circuit would give other results without the
+  native package.
+- A design with races behaves differently: the 74193 counter counts wrong in `fast`, and
+  its functional netlist also in `cycle`.
+- `cycle` has no gate delays or glitches, which DigSim shows, and the ports of the gate
+  cells are not in the VCD file.
 
 ## Findings
 
