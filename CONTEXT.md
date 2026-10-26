@@ -15,21 +15,23 @@ the Python engine as the fallback on hosts where the package isn't installed.
   About 10x Python on Yosys netlists, gates and functional.
 - Two engines only: native (the default when the package can be imported) and Python
   (`DIGSIM_ENGINE=python`, or without the package).
-- The branch is made from `main` at 3b30fbc (release 1.8.0), and not merged. The
+- The branch is rebased on `main` at d490e3d (1.8.0 and the inout ports), and not merged. The
   package isn't built in CI or published yet, see "Delivering the wheels".
 
 ## Commits
 
-1. 97956b6: the trial. Trial 1 moved only the event queue to Rust (1.2x, since removed).
+1. 1928547: the trial. Trial 1 moved only the event queue to Rust (1.2x, since removed).
    Trial 2 is the engine: the event loop, the Yosys gate cells and the bus ports in Rust.
-2. bd99817: the functional Yosys cells (`$add`, `$mux`, `$dff` ...) in Rust too.
-3. 83e0ce2: a faster event loop (lock without atomics, 24-byte events, values in a slab,
+2. 04215a9: the functional Yosys cells (`$add`, `$mux`, `$dff` ...) in Rust too.
+3. 6f5936a: a faster event loop (lock without atomics, 24-byte events, values in a slab,
    flat fan-out lists): 1.4x on gate netlists.
-4. cdba95e: the `fast` and `cycle` modes, which give up the exact order of events.
-5. c2570f8: `fast`, `cycle` and the queue-only mode removed again. Only exact results.
-6. This file and `tools/`.
-7. 060e317, 89a800a: the RISC-V processor in `riscv32/`, cherry-picked from the
+4. e47b8b0: the `fast` and `cycle` modes, which give up the exact order of events.
+5. 617b38c: `fast`, `cycle` and the queue-only mode removed again. Only exact results.
+6. d26fe7e: this file and `tools/`.
+7. de52465, 23dd9d5: the RISC-V processor in `riscv32/`, cherry-picked from the
    `synth-parameters` branch (f907aa3, f428a59).
+8. 57131ef: after the rebase on the inout ports, the engine takes the events that ports
+   add in `init()` (an inout port drives "Z" from the start), it dropped them before.
 
 ## How it works
 
@@ -74,7 +76,7 @@ the Python engine as the fallback on hosts where the package isn't installed.
 
 ```sh
 native/build.sh                       # build the wheel, install it into .venv (offline)
-uv run --with pytest pytest           # 997 tests, native engine
+uv run --with pytest pytest           # 1034 tests, native engine
 DIGSIM_ENGINE=python uv run --with pytest pytest
 sh native/tools/compare_engines.sh    # must print "The engines agree"
 cd native && cargo clippy --release
@@ -82,8 +84,9 @@ cd native && cargo clippy --release
 
 Also run before merging: every example in both engines against a `git archive` copy of
 `main` (the CLAUDE.md rule), `tools/gui_fuzz.py --seeds 3,11,21 --steps 300`,
-`tools/gui_editor_check.py` and the riscv32 suite. All of them passed at 83e0ce2, the
-engine code is the same now.
+`tools/gui_editor_check.py` and the riscv32 suite. All of them passed at 6f5936a. After
+the rebase on the inout ports, pytest in both engines, `compare_engines.sh`, the riscv32
+suite and `examples/yosys_inout` in both engines passed, the GUI checks weren't run.
 
 `uv run` from the repo root reinstalls the project but keeps the wheel in `.venv`. A new
 virtual environment needs `native/build.sh` again, or it silently runs Python.
