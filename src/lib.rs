@@ -103,9 +103,19 @@ enum Kind {
     Sdff,
     Sdffe,
     Sdffce,
+    Tbuf,
+    Const,
+    Sr,
+    Dlatch,
+    DlatchReset,
+    DlatchSr,
+    Aldff,
+    Aldffe,
+    Dffsr,
+    Dffsre,
 }
 
-const KINDS: [Kind; 26] = {
+const KINDS: [Kind; 36] = {
     use Kind::*;
     [
         Buf,
@@ -134,25 +144,63 @@ const KINDS: [Kind; 26] = {
         Sdff,
         Sdffe,
         Sdffce,
+        Tbuf,
+        Const,
+        Sr,
+        Dlatch,
+        DlatchReset,
+        DlatchSr,
+        Aldff,
+        Aldffe,
+        Dffsr,
+        Dffsre,
     ]
 };
 
+// The inputs of flip-flops and latches, the ones a kind doesn't have aren't read
+const C: usize = 0;
+const D: usize = 1;
+const E: usize = 2;
+const R: usize = 3;
+const S: usize = 4;
+const L: usize = 5;
+const AD: usize = 6;
+
 struct Cell {
     kind: Kind,
-    // The input ports, in the order of the kind; flip-flops: C, D, E, R
-    // The first of the input ports in Inner.cell_inputs
+    // The input ports, in the order of the kind; flip-flops and latches: C, D, E, R, S,
+    // L, AD. The first of the input ports in Inner.cell_inputs.
     first: u32,
     output: u32,
     clock_edge: u8,
     reset_level: u8,
     reset_value: u8,
     enable_level: u8,
+    set_level: u8,
+    load_level: u8,
     old_clock: u8,
 }
 
 struct Bus {
     bits: Vec<u32>,
     value: BusValue,
+}
+
+/// resolve() in _port.py: the value of the drivers that drive, Z if none does, X if they
+/// drive different values
+fn resolve(values: impl Iterator<Item = u8>) -> u8 {
+    let mut result = Z;
+    for value in values {
+        if value == Z {
+            continue;
+        }
+        if result == Z {
+            result = value;
+        } else if result != value {
+            return X;
+        }
+    }
+    result
 }
 
 // Three-valued logic, the same as _yosys_atoms.py
@@ -230,10 +278,13 @@ struct Inner {
     // The ports each port drives: wired_targets[wired_start[p]..wired_start[p + 1]]
     wired_start: Vec<u32>,
     wired_targets: Vec<u32>,
+    // The drivers of a port with several (resolve()): drivers[driver_start[p]..[p + 1]]
+    driver_start: Vec<u32>,
+    drivers: Vec<u32>,
     delay: Vec<i64>,
     toplevel: Vec<bool>,
     cells: Vec<Cell>,
-    // The input ports of the cells, in the order of each kind; flip-flops: C, D, E, R
+    // The input ports of the cells, in the order of each kind
     cell_inputs: Vec<u32>,
     buses: Vec<Bus>,
     words: Vec<word::Cell>,
@@ -324,6 +375,9 @@ impl Inner {
         let cell = &mut self.cells[c];
         let inputs = &self.cell_inputs[cell.first as usize..];
         let v = |i: usize| self.value[inputs[i] as usize];
+        let enabled = |cell: &Cell| v(E) == cell.enable_level;
+        let reset = |cell: &Cell| v(R) == cell.reset_level;
+        let set = |cell: &Cell| v(S) == cell.set_level;
         use Kind::*;
         let out = match cell.kind {
             Buf => v(0),
@@ -367,11 +421,44 @@ impl Inner {
             Oai3 => not(and(or(v(0), v(1)), v(2))),
             Aoi4 => not(or(and(v(0), v(1)), and(v(2), v(3)))),
             Oai4 => not(and(or(v(0), v(1)), or(v(2), v(3)))),
-            Dff | Dffe | DffAsyncReset | DffeAsyncReset | Sdff | Sdffe | Sdffce => {
-                let clock = v(0);
+            Tbuf => match v(1) {
+                1 => v(0),
+                0 => Z,
+                _ => X,
+            },
+            // GND and VDD, their outputs are set once by their default state
+            Const => return None,
+            Sr => {
+                return if reset(cell) {
+                    Some(0)
+                } else if set(cell) {
+                    Some(1)
+                } else {
+                    None
+                };
+            }
+            Dlatch => return enabled(cell).then(|| v(D)),
+            DlatchReset => {
+                return if reset(cell) {
+                    Some(cell.reset_value)
+                } else {
+                    enabled(cell).then(|| v(D))
+                };
+            }
+            DlatchSr => {
+                return if reset(cell) {
+                    Some(0)
+                } else if set(cell) {
+                    Some(1)
+                } else {
+                    enabled(cell).then(|| v(D))
+                };
+            }
+            Dff | Dffe | DffAsyncReset | DffeAsyncReset | Sdff | Sdffe | Sdffce | Aldff
+            | Aldffe | Dffsr | Dffsre => {
+                let clock = v(C);
                 let edge = clock != cell.old_clock && clock == cell.clock_edge;
-                let enabled = |cell: &Cell| v(2) == cell.enable_level;
-                let reset = |cell: &Cell| v(3) == cell.reset_level;
+                let load = |cell: &Cell| v(L) == cell.load_level;
                 let out = match cell.kind {
                     Dff => edge.then(|| v(1)),
                     Dffe => (edge && enabled(cell)).then(|| v(1)),
@@ -401,13 +488,45 @@ impl Inner {
                             None
                         }
                     }
-                    _ => (edge && enabled(cell)).then(|| {
+                    Sdffce => (edge && enabled(cell)).then(|| {
                         if reset(cell) {
                             cell.reset_value
                         } else {
                             v(1)
                         }
                     }),
+                    Aldff => {
+                        if load(cell) {
+                            Some(v(AD))
+                        } else {
+                            edge.then(|| v(D))
+                        }
+                    }
+                    Aldffe => {
+                        if load(cell) {
+                            Some(v(AD))
+                        } else {
+                            (edge && enabled(cell)).then(|| v(D))
+                        }
+                    }
+                    Dffsr => {
+                        if reset(cell) {
+                            Some(0)
+                        } else if set(cell) {
+                            Some(1)
+                        } else {
+                            edge.then(|| v(D))
+                        }
+                    }
+                    _ => {
+                        if reset(cell) {
+                            Some(0)
+                        } else if set(cell) {
+                            Some(1)
+                        } else {
+                            (edge && enabled(cell)).then(|| v(D))
+                        }
+                    }
                 };
                 cell.old_clock = clock;
                 return out;
@@ -548,9 +667,45 @@ impl<'a, 'py> Ctx<'a, 'py> {
         Ok(())
     }
 
+    // The value of the drivers of a port with several, _Drivers.set_value()
+    fn resolved(&mut self, port: u32) -> PyResult<u8> {
+        let p = port as usize;
+        let (start, end) = {
+            let st = self.st();
+            (st.driver_start[p] as usize, st.driver_start[p + 1] as usize)
+        };
+        let mut values = Vec::with_capacity(end - start);
+        for i in start..end {
+            let st = self.st();
+            let driver = st.drivers[i] as usize;
+            let value = match st.kind[driver] {
+                BUS => bus_to_bit(st.buses[st.owner[driver] as usize].value),
+                // The value is in Python
+                PY | WORD => {
+                    let engine = self.engine;
+                    self.guard = None;
+                    let result = engine
+                        .port(self.py, driver)
+                        .getattr(intern!(self.py, "value"));
+                    self.guard = Some(engine.inner.lock());
+                    bit_code(&result?)?
+                }
+                _ => st.value[driver],
+            };
+            values.push(value);
+        }
+        Ok(resolve(values.into_iter()))
+    }
+
     // Port.set_value() with a one-bit value
     fn set_value(&mut self, port: u32, value: u8) -> PyResult<()> {
         let p = port as usize;
+        let st = self.st();
+        let value = if st.driver_start[p] != st.driver_start[p + 1] {
+            self.resolved(port)?
+        } else {
+            value
+        };
         match self.st().kind[p] {
             IN => {
                 if value != self.st().value[p] {
@@ -817,9 +972,10 @@ impl Engine {
         owners: Vec<u32>,
         values: Vec<u8>,
         wired: Vec<Vec<u32>>,
+        drivers: Vec<Vec<u32>>,
         delays: Vec<i64>,
         toplevel: Vec<bool>,
-        cells: Vec<(u8, Vec<u32>, u32, [u8; 4], u8)>,
+        cells: Vec<(u8, Vec<u32>, u32, [u8; 6], u8)>,
         buses: Vec<(Vec<u32>, Bound<'_, PyAny>)>,
         aux: Vec<u32>,
         words: Vec<WordCellArgs>,
@@ -832,6 +988,13 @@ impl Engine {
             wired_targets.extend_from_slice(targets);
         }
         wired_start.push(wired_targets.len() as u32);
+        let mut driver_start = Vec::with_capacity(drivers.len() + 1);
+        let mut all_drivers = Vec::new();
+        for port_drivers in &drivers {
+            driver_start.push(all_drivers.len() as u32);
+            all_drivers.extend_from_slice(port_drivers);
+        }
+        driver_start.push(all_drivers.len() as u32);
         let mut word_cells = Vec::with_capacity(words.len());
         for (kind, inputs, outputs, params, q, old_clock) in words {
             let kind = *word::KINDS.get(kind as usize).ok_or_else(|| {
@@ -891,6 +1054,8 @@ impl Engine {
                 reset_level: levels[1],
                 reset_value: levels[2],
                 enable_level: levels[3],
+                set_level: levels[4],
+                load_level: levels[5],
                 old_clock,
             });
             cell_inputs.extend_from_slice(&inputs);
@@ -918,6 +1083,8 @@ impl Engine {
                 value: values,
                 wired_start,
                 wired_targets,
+                driver_start,
+                drivers: all_drivers,
                 delay: delays,
                 toplevel,
                 cells: native_cells,
@@ -1044,6 +1211,8 @@ impl Engine {
         st.wired_targets.extend_from_slice(&wired);
         let end = st.wired_targets.len() as u32;
         st.wired_start.push(end);
+        let end = st.drivers.len() as u32;
+        st.driver_start.push(end);
         st.delay.push(0);
         st.toplevel.push(toplevel);
         st.latest.push(Latest::default());
