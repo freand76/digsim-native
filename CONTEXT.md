@@ -15,7 +15,7 @@ the Python engine as the fallback on hosts where the package isn't installed.
   About 10x Python on Yosys netlists, gates and functional.
 - Two engines only: native (the default when the package can be imported) and Python
   (`DIGSIM_ENGINE=python`, or without the package).
-- The branch is local, made from `main` at 3b30fbc (release 1.8.0), and not merged. The
+- The branch is made from `main` at 3b30fbc (release 1.8.0), and not merged. The
   package isn't built in CI or published yet, see "Delivering the wheels".
 
 ## Commits
@@ -28,6 +28,8 @@ the Python engine as the fallback on hosts where the package isn't installed.
 4. cdba95e: the `fast` and `cycle` modes, which give up the exact order of events.
 5. c2570f8: `fast`, `cycle` and the queue-only mode removed again. Only exact results.
 6. This file and `tools/`.
+7. 060e317, 89a800a: the RISC-V processor in `riscv32/`, cherry-picked from the
+   `synth-parameters` branch (f907aa3, f428a59).
 
 ## How it works
 
@@ -60,8 +62,11 @@ the Python engine as the fallback on hosts where the package isn't installed.
   VCD files byte for byte
 - `native/tools/rewire_6502.py`: a 6502 that gets a second driver on RDY halfway, to
   check the handover from the native engine to Python
-- `native/tools/rv32_bench.py`: times the rv32 self test, needs `riscv32/` from the
-  `synth-parameters` branch
+- `native/tools/rv32_bench.py`: times the rv32 self test, `python native/tools/rv32_bench.py
+  riscv32 rv32i gates 3000`
+- `riscv32/`: the RISC-V processor (from the `synth-parameters` branch), designed and
+  verified with DigSim, the biggest benchmark of the engine. Its tests:
+  `uv run --with pytest pytest riscv32/tests` (minutes)
 - `src/digsim/circuit/_native.py` (new) and `_circuit.py` (uses the engine in `init()`,
   `run()`, `process_single_event()`, `add_event()`)
 

@@ -2,8 +2,8 @@
 # All rights reserved
 
 """
-Time the rv32 self test with the engine of DIGSIM_ENGINE. Needs the riscv32/ folder of
-the synth-parameters branch (the RISC-V experiment), given as the first argument.
+Time the rv32 self test with the engine of DIGSIM_ENGINE. The first argument is the
+riscv32/ folder (the RISC-V processor).
 
 Usage: python native/tools/rv32_bench.py <riscv32 folder> rv32i|rv32im|rv32ic|rv32imc
        gates|functional <cycles>
