@@ -538,7 +538,7 @@ impl Inner {
 
 // A functional cell from Python: kind, inputs (width, update, bits, undefined bits),
 // outputs (width, bit ports, bits with ports that drive something, word port, links, last
-// value), parameters, Q and the clock level
+// value), parameters, Q, the clock level and if a tristate buffer drives
 type WordCellArgs = (
     u8,
     Vec<(usize, bool, BigUint, BigUint)>,
@@ -553,6 +553,7 @@ type WordCellArgs = (
     HashMap<String, BigInt>,
     (BigUint, BigUint),
     u8,
+    bool,
 );
 
 /// The simulation of a circuit, see digsim/circuit/_native.py
@@ -996,7 +997,7 @@ impl Engine {
         }
         driver_start.push(all_drivers.len() as u32);
         let mut word_cells = Vec::with_capacity(words.len());
-        for (kind, inputs, outputs, params, q, old_clock) in words {
+        for (kind, inputs, outputs, params, q, old_clock, driving) in words {
             let kind = *word::KINDS.get(kind as usize).ok_or_else(|| {
                 PyValueError::new_err(format!("Unknown functional cell kind {kind}"))
             })?;
@@ -1038,6 +1039,7 @@ impl Engine {
                     u: q.1.into(),
                 },
                 old_clock,
+                driving,
             ));
         }
         let count = ports.len();
@@ -1262,7 +1264,7 @@ impl Engine {
     }
 
     /// The state of each functional cell for going back to Python: the values of its
-    /// inputs, the last values of its outputs, Q and the clock level
+    /// inputs, the last values of its outputs, Q, the clock level and if it drives
     #[allow(clippy::type_complexity)]
     fn export_words<'py>(
         &self,
@@ -1272,6 +1274,7 @@ impl Engine {
         Vec<Option<(BigUint, BigUint)>>,
         (BigUint, BigUint),
         Bound<'py, PyAny>,
+        bool,
     )> {
         let st = self.inner.lock();
         st.words
@@ -1288,6 +1291,7 @@ impl Engine {
                         .collect(),
                     ((&cell.q.v).into(), (&cell.q.u).into()),
                     self.values[cell.old_clock as usize].bind(py).clone(),
+                    cell.driving,
                 )
             })
             .collect()

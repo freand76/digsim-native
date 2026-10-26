@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 // Values of one-bit ports, as in lib.rs
 const X: u8 = 2;
+const Z: u8 = 3;
 
 pub type W = Bits;
 
@@ -229,16 +230,26 @@ pub enum Kind {
     Dlatchsr,
     Sr,
     Decoder,
+    Alu,
+    Lcu,
+    Fa,
+    MaccV2,
+    Lut,
+    Sop,
+    Bweqx,
+    Concat,
+    Slice,
+    Tribuf,
 }
 
-pub const KINDS: [Kind; 56] = {
+pub const KINDS: [Kind; 66] = {
     use Kind::*;
     [
         Not, Pos, Neg, And, Or, Xor, Xnor, ReduceAnd, ReduceOr, ReduceXor, ReduceXnor, LogicNot,
         LogicAnd, LogicOr, Shl, Shr, Sshr, Shift, Shiftx, Lt, Le, Gt, Ge, Eq, Ne, Eqx, Nex, Add,
         Sub, Mul, Div, Mod, DivFloor, ModFloor, Pow, Mux, Pmux, Bmux, Demux, Bwmux, Dff, Dffe,
         Adff, Adffe, Aldff, Aldffe, Sdff, Sdffe, Sdffce, Dffsr, Dffsre, Dlatch, Adlatch, Dlatchsr,
-        Sr, Decoder,
+        Sr, Decoder, Alu, Lcu, Fa, MaccV2, Lut, Sop, Bweqx, Concat, Slice, Tribuf,
     ]
 };
 
@@ -286,6 +297,10 @@ pub struct Cell {
     values: Vec<W>,
     none: W,
     flips: HashMap<W, W>,
+    // Sum of products: for each term, the bits of A that must be 0 and those that must be 1
+    terms: Vec<(W, W)>,
+    // Tristate buffer: if it drives its output
+    pub driving: bool,
     // The parameters an update uses, read once
     a_signed: bool,
     b_signed: bool,
@@ -299,6 +314,8 @@ pub struct Cell {
     arst_value: Word,
     srst_value: Word,
     y_mask: W,
+    lut: BigInt,
+    offset: usize,
 }
 
 impl Cell {
@@ -309,6 +326,7 @@ impl Cell {
         params: HashMap<String, BigInt>,
         q: Word,
         old_clock: u8,
+        driving: bool,
     ) -> Cell {
         let mut cell = Cell {
             kind,
@@ -321,6 +339,8 @@ impl Cell {
             values: Vec::new(),
             none: W::zero(),
             flips: HashMap::new(),
+            terms: Vec::new(),
+            driving,
             a_signed: false,
             b_signed: false,
             set_polarity: false,
@@ -333,6 +353,8 @@ impl Cell {
             arst_value: Word::default(),
             srst_value: Word::default(),
             y_mask: W::zero(),
+            lut: BigInt::zero(),
+            offset: 0,
         };
         let q_width = cell.outputs.first().map_or(0, |o| o.width);
         cell.width = cell
@@ -374,6 +396,27 @@ impl Cell {
                 let flip = cell.flips.entry(value.clone()).or_default();
                 *flip |= &(W::one() << index);
                 cell.values.push(value);
+            }
+        }
+        cell.lut = cell.param("LUT", 0);
+        cell.offset = cell.param("OFFSET", 0).to_usize().unwrap_or(usize::MAX);
+        if kind == Kind::Sop {
+            let width = cell.width_of(0);
+            let table = cell.param("TABLE", 0);
+            let depth = cell.param("DEPTH", 0).to_usize().unwrap_or(0);
+            for term in 0..depth {
+                let (mut zeros, mut ones) = (W::zero(), W::zero());
+                for index in 0..width {
+                    let pair = (&table >> (2 * width * term + 2 * index)) & BigInt::from(3);
+                    let pair = pair.to_u8().unwrap_or(0);
+                    if pair & 1 != 0 {
+                        zeros.set_bit(index, true);
+                    }
+                    if pair & 2 != 0 {
+                        ones.set_bit(index, true);
+                    }
+                }
+                cell.terms.push((zeros, ones));
             }
         }
         cell
@@ -866,12 +909,229 @@ impl Cell {
                     Word::new(andnot(&self.none, &u), u)
                 }
             }
+            Alu | Lcu | Fa | MaccV2 | Lut | Sop | Bweqx | Concat | Slice | Tribuf => {
+                self.update_other(events);
+                return;
+            }
             _ => {
                 self.update_register(events);
                 return;
             }
         };
         self.write(0, word, events);
+    }
+
+    /// The (offset, width, signed) of each part of a port of $macc_v2
+    fn parts(&self, count: usize, widths: &str, signed: &str) -> Vec<(usize, usize, bool)> {
+        let (widths, signed) = (self.param(widths, 0), self.param(signed, 0));
+        let mut offset = 0;
+        (0..count)
+            .map(|index| {
+                let width = ((&widths >> (16 * index)) & BigInt::from(0xFFFF))
+                    .to_usize()
+                    .unwrap_or(0);
+                let part_signed = !((&signed >> index) & BigInt::one()).is_zero();
+                let part = (offset, width, part_signed);
+                offset += width;
+                part
+            })
+            .collect()
+    }
+
+    // The cells of other synthesis flows, their inputs and outputs in the order of
+    // _yosys_functional.py
+    fn update_other(&mut self, events: &mut Vec<Write>) {
+        use Kind::*;
+        match self.kind {
+            // A, B, CI, BI; X, Y, CO
+            Alu => {
+                let width = self.outputs[1].width;
+                let m = mask(width);
+                let signed = self.a_signed && self.b_signed;
+                let a = extend(self.read(0), self.width_of(0), signed, width);
+                let mut b = extend(self.read(1), self.width_of(1), signed, width);
+                let ci = self.read(2).clone();
+                let bi = self.read(3);
+                let bi_undefined = !bi.u.is_zero();
+                if bi_undefined {
+                    b = undefined(width);
+                } else if !bi.v.is_zero() {
+                    b = Word::new(andnot(&andnot(&m, &b.v), &b.u), b.u);
+                }
+                let u = (&a.u | &b.u) & &m;
+                self.write(0, Word::new(andnot(&(&a.v ^ &b.v), &u), u.clone()), events);
+                if !u.is_zero() || !ci.u.is_zero() || bi_undefined {
+                    // As in Verilog, an undefined bit makes the sum and the carries undefined
+                    self.write(1, undefined(width), events);
+                    self.write(2, undefined(width), events);
+                    return;
+                }
+                let total =
+                    Bits::from(BigUint::from(&a.v) + BigUint::from(&b.v) + BigUint::from(&ci.v));
+                self.write(1, Word::new(&total & &m, W::zero()), events);
+                // The carry into bit i+1 is the sum bit XOR the operand bits, for bit i+1
+                let carries = ((total ^ &a.v) ^ &b.v) >> 1;
+                self.write(2, Word::new(carries & &m, W::zero()), events);
+            }
+            // P, G, CI; CO
+            Lcu => {
+                let width = self.outputs[0].width;
+                let (p, g, ci) = (self.read(0), self.read(1), self.read(2));
+                let word = if !p.u.is_zero() || !g.u.is_zero() || !ci.u.is_zero() {
+                    undefined(width)
+                } else {
+                    let mut carry = bit(&ci.v, 0);
+                    let mut co = W::zero();
+                    for index in 0..width {
+                        carry = bit(&g.v, index) || (bit(&p.v, index) && carry);
+                        if carry {
+                            co.set_bit(index, true);
+                        }
+                    }
+                    Word::new(co, W::zero())
+                };
+                self.write(0, word, events);
+            }
+            // A, B, C; X (the carry), Y (the sum)
+            Fa => {
+                let m = mask(self.outputs[1].width);
+                let (a, b, c) = (self.read(0), self.read(1), self.read(2));
+                let u = (&a.u | &b.u | &c.u) & &m;
+                let y = andnot(&(&a.v ^ &b.v ^ &c.v), &u);
+                let x = andnot(&((&a.v & &b.v) | (&c.v & (&a.v ^ &b.v))), &u);
+                self.write(1, Word::new(y, u.clone()), events);
+                self.write(0, Word::new(x, u), events);
+            }
+            // A, B, C; Y
+            MaccV2 => {
+                let width = self.outputs[0].width;
+                let (a, b, c) = (self.read(0), self.read(1), self.read(2));
+                if !a.u.is_zero() || !b.u.is_zero() || !c.u.is_zero() {
+                    self.write(0, undefined(width), events);
+                    return;
+                }
+                let products = self.param("NPRODUCTS", 0).to_usize().unwrap_or(0);
+                let addends = self.param("NADDENDS", 0).to_usize().unwrap_or(0);
+                let a_parts = self.parts(products, "A_WIDTHS", "A_SIGNED");
+                let b_parts = self.parts(products, "B_WIDTHS", "B_SIGNED");
+                let c_parts = self.parts(addends, "C_WIDTHS", "C_SIGNED");
+                let product_negated = self.param("PRODUCT_NEGATED", 0);
+                let addend_negated = self.param("ADDEND_NEGATED", 0);
+                let operand = |value: &W, (offset, width, _): (usize, usize, bool), signed_part| {
+                    let bits = (value >> offset) & mask(width);
+                    if signed_part {
+                        signed(&bits, width)
+                    } else {
+                        big(&bits)
+                    }
+                };
+                let negated =
+                    |flags: &BigInt, index: usize| !((flags >> index) & BigInt::one()).is_zero();
+                let mut total = BigInt::zero();
+                for index in 0..products {
+                    // Signed only if both factors are
+                    let signed_part = a_parts[index].2 && b_parts[index].2;
+                    let product = operand(&a.v, a_parts[index], signed_part)
+                        * operand(&b.v, b_parts[index], signed_part);
+                    if negated(&product_negated, index) {
+                        total -= product;
+                    } else {
+                        total += product;
+                    }
+                }
+                for (index, part) in c_parts.iter().enumerate() {
+                    let addend = operand(&c.v, *part, part.2);
+                    if negated(&addend_negated, index) {
+                        total -= addend;
+                    } else {
+                        total += addend;
+                    }
+                }
+                self.write(0, Word::new(bits_of(&total, width), W::zero()), events);
+            }
+            // A; Y
+            Lut => {
+                let a = self.read(0);
+                let word = if !a.u.is_zero() {
+                    Word::bit(0, 1)
+                } else {
+                    let index = to_usize(&a.v);
+                    let one = !((&self.lut >> index) & BigInt::one()).is_zero();
+                    Word::bit(one as u32, 0)
+                };
+                self.write(0, word, events);
+            }
+            // A; Y
+            Sop => {
+                let a = self.read(0);
+                let mut maybe = false;
+                let mut word = None;
+                for (zeros, ones) in &self.terms {
+                    let known_one = andnot(&(&a.v & zeros), &a.u);
+                    let known_zero = andnot(&andnot(ones, &a.v), &a.u);
+                    if !known_one.is_zero() || !known_zero.is_zero() {
+                        // A known bit doesn't match the term
+                        continue;
+                    }
+                    if (&a.u & (zeros | ones)).is_zero() {
+                        word = Some(Word::bit(1, 0));
+                        break;
+                    }
+                    maybe = true;
+                }
+                let word = word.unwrap_or_else(|| Word::bit(0, maybe as u32));
+                self.write(0, word, events);
+            }
+            // A, B; Y
+            Bweqx => {
+                let (a, b) = (self.read(0), self.read(1));
+                let differ = (&a.v ^ &b.v) | (&a.u ^ &b.u);
+                let word = Word::new(andnot(&self.outputs[0].mask, &differ), W::zero());
+                self.write(0, word, events);
+            }
+            // A, B; Y = {B, A}
+            Concat => {
+                let shift = self.width_of(0);
+                let (a, b) = (self.read(0), self.read(1));
+                let word = Word::new(&a.v | (&b.v << shift), &a.u | (&b.u << shift));
+                self.write(0, word, events);
+            }
+            // A; Y = A >> OFFSET
+            Slice => {
+                let a = self.read(0);
+                let word = Word::new(&a.v >> self.offset, &a.u >> self.offset);
+                self.write(0, word, events);
+            }
+            // A, EN; Y
+            Tribuf => {
+                let enable = self.read_bit(1);
+                if enable == 0 {
+                    if self.driving {
+                        // Not driven: the bits are Z (for a cell it drives as a word, X)
+                        self.driving = false;
+                        let out = &mut self.outputs[0];
+                        for port in &out.bit_ports {
+                            events.push(Write::Bit(*port, Z));
+                        }
+                        if let Some(port) = out.word_port {
+                            events.push(Write::Word(port, &out.mask << out.width));
+                        }
+                        // All bits get an event when it drives again
+                        out.last = None;
+                    }
+                    return;
+                }
+                self.driving = true;
+                let width = self.outputs[0].width;
+                let word = if enable == 1 {
+                    self.read(0).clone()
+                } else {
+                    undefined(width)
+                };
+                self.write(0, word, events);
+            }
+            _ => {}
+        }
     }
 
     fn arithmetic(&self, a: BigInt, b: BigInt, y_width: usize) -> Option<BigInt> {
