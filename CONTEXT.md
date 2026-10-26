@@ -32,14 +32,20 @@ the Python engine as the fallback on hosts where the package isn't installed.
    `synth-parameters` branch (f907aa3, f428a59).
 8. 57131ef: after the rebase on the inout ports, the engine takes the events that ports
    add in `init()` (an inout port drives "Z" from the start), it dropped them before.
+9. 3ff5e0f: the other gate cells (tristate buffer, latches, async load and set/reset
+   flip-flops), GND and VDD, and the one-bit ports with several drivers, resolved in Rust.
+10. fe94d4e: the other functional cells (`$alu`, `$macc_v2`, `$lut`, `$tribuf` ...).
+    Both checked with the random netlists of `tools/fuzz_engines.sh` (200 seeds each),
+    byte-identical VCDs.
 
 ## How it works
 
 - `src/digsim/circuit/_native.py` imports `digsim_native` if it can. `Circuit.init()`
   builds a `NativeEngine` from the circuit: the ports, the wires, and the cells it can
-  simulate (`_GATES`, `_FLIP_FLOPS`, `_FUNCTIONAL`, buses up to 64 bits).
+  simulate (`_GATES`, `_STATEFUL`, `_FUNCTIONAL`: every Yosys cell, GND, VDD), buses up
+  to 64 bits, and the one-bit ports with several drivers, which it resolves itself.
 - Everything else stays a Python component (the GUI components, memories, user
-  components, a few Yosys cells listed in the README). The engine calls their ports from
+  components). The engine calls their ports from
   the same queue, and they call back through `Circuit.add_event()`.
 - The ports the engine simulates get a subclass while it runs: their `_value` property
   reads the engine and `set_value` sets the value in the engine. Python code that reads
@@ -59,6 +65,9 @@ the Python engine as the fallback on hosts where the package isn't installed.
 
 - `native/`: the Rust package (`Cargo.toml`, `Cargo.lock`, `pyproject.toml` for
   maturin, `src/`), `build.sh`, `README.md`, this file
+- `native/tools/fuzz_engines.sh`: random circuits of gate cells (`fuzz_gates.py`) and
+  netlists of functional cells (`fuzz_functional.py`) in both engines, compared byte for
+  byte
 - `native/tools/compare_engines.sh`: runs the 6502 example (gates, functional, with and
   without `--signals`) and `rewire_6502.py` in both engines and compares the output and
   VCD files byte for byte
@@ -79,6 +88,7 @@ native/build.sh                       # build the wheel, install it into .venv (
 uv run --with pytest pytest           # 1034 tests, native engine
 DIGSIM_ENGINE=python uv run --with pytest pytest
 sh native/tools/compare_engines.sh    # must print "The engines agree"
+sh native/tools/fuzz_engines.sh       # random circuits, must print "The engines agree"
 cd native && cargo clippy --release
 ```
 
@@ -86,7 +96,9 @@ Also run before merging: every example in both engines against a `git archive` c
 `main` (the CLAUDE.md rule), `tools/gui_fuzz.py --seeds 3,11,21 --steps 300`,
 `tools/gui_editor_check.py` and the riscv32 suite. All of them passed at 6f5936a. After
 the rebase on the inout ports, pytest in both engines, `compare_engines.sh`, the riscv32
-suite and `examples/yosys_inout` in both engines passed, the GUI checks weren't run.
+suite and `examples/yosys_inout` in both engines passed. At 3ff5e0f and the functional
+cells after it: pytest in both engines, every example in both engines (byte-identical
+output and VCD files), `compare_engines.sh`, `gui_fuzz.py` and `gui_editor_check.py`.
 
 `uv run` from the repo root reinstalls the project but keeps the wheel in `.venv`. A new
 virtual environment needs `native/build.sh` again, or it silently runs Python.
@@ -120,9 +132,6 @@ gain is then much smaller.
 
 ## Not done
 
-- Some cells are still Python (the gate tristate buffer, latches, `_ALDFF_`, `_DFFSR_`,
-  `$alu`, `$lcu`, `$fa`, `$macc_v2`, `$lut`, `$sop`, `$bweqx`, `$concat`, `$slice`,
-  `$tribuf`). They work, they are slower.
 - After the wires change, the engine stays off until the next `init()`. It could build a
   new engine from the current state.
 - GUI circuits of single gates use the Python gate components, which the engine calls

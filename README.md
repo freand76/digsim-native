@@ -20,11 +20,12 @@ Rust, the loop, the ports and all components in Python. The queue is CPython's h
 algorithm step by step, so events at the same time keep their order.
 
 **Trial 2, the circuit handling too** (`Engine`): Rust runs the event loop, and simulates
-the Yosys gate cells (the gates, muxes and the D flip-flops with reset and enable), the
-functional cells (`native/src/word.rs`: arithmetic, comparisons, shifts, muxes, the
-decoders, flip-flops and latches) and the bus ports (`PortMultiBitWire` up to 64 bits and
-their `PortWireBit` bits). Every other
-component and port stays in Python: the engine calls `set_value()` and `delta_cycle()` of
+every Yosys gate cell (the gates, muxes, tristate buffers, flip-flops and latches) and
+functional cell (`native/src/word.rs`: arithmetic, comparisons, shifts, muxes, the
+decoders, flip-flops, latches, `$alu`, `$macc_v2`, `$lut`, `$tribuf` ...), GND and VDD,
+and the bus ports (`PortMultiBitWire` up to 64 bits and their `PortWireBit` bits). A
+one-bit port with several drivers (a tristate bus) gets its value from them in Rust, as
+`resolve()` does. Every other component and port stays in Python: the engine calls `set_value()` and `delta_cycle()` of
 Python ports from the same queue, and Python calls back into the engine through
 `Circuit.add_event()` and through the ports the engine took over. Those ports get a
 subclass while the engine runs, their `_value` is read from the engine, so Python code
@@ -154,10 +155,8 @@ The Rust part fits as a separate optional package, `digsim-native`, built with m
 
 ## Not done in the trial
 
-- Some cells are Python: the gate tristate buffer, latches and the other gate flip-flops
-  (`_ALDFF_`, `_DFFSR_`), and the functional `$alu`, `$lcu`, `$fa`, `$macc_v2`, `$lut`,
-  `$sop`, `$bweqx`, `$concat`, `$slice` and `$tribuf`. A netlist with them works, those
-  cells are slower, and functional cells linked as words to one of them stay Python too.
+- A bus port with several drivers (two tristate outputs of components on one bus) is
+  resolved in Python. Inside a netlist a tristate bus is resolved per bit, natively.
 - After the wires change, the engine stays off until the next `init()`. It could build a
   new engine from the current state instead.
 - The engine state is behind a mutex (the GUI simulates in a thread). Without the GIL
