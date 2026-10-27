@@ -1,7 +1,8 @@
 name: Wheels
 
 # Builds the wheels (abi3, one per platform for every Python from 3.11) and tests those that
-# run on the build runner with the DigSim tests. A tag vX.Y.Z attaches them to a release.
+# run on the build runner with the DigSim tests (test: full), or only imports them. A tag
+# vX.Y.Z attaches them to a release.
 
 on:
   push:
@@ -35,13 +36,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-x86_64, os: ubuntu-latest, target: x86_64, manylinux: "2014", test: true }
-          - { name: linux-aarch64, os: ubuntu-24.04-arm, target: aarch64, manylinux: "2014", test: true }
+          - { name: linux-x86_64, os: ubuntu-latest, target: x86_64, manylinux: "2014", test: full }
+          - { name: linux-aarch64, os: ubuntu-24.04-arm, target: aarch64, manylinux: "2014", test: full }
           - { name: musllinux-x86_64, os: ubuntu-latest, target: x86_64, manylinux: musllinux_1_2 }
           - { name: musllinux-aarch64, os: ubuntu-24.04-arm, target: aarch64, manylinux: musllinux_1_2 }
-          - { name: windows-x64, os: windows-latest, target: x64, rust: x86_64-pc-windows-msvc, python-arch: x64, test: true }
-          - { name: windows-arm64, os: windows-11-arm, target: aarch64, rust: aarch64-pc-windows-msvc, python-arch: arm64, test: true }
-          - { name: macos-arm64, os: macos-latest, target: aarch64, rust: aarch64-apple-darwin, python-arch: arm64, test: true }
+          - { name: windows-x64, os: windows-latest, target: x64, rust: x86_64-pc-windows-msvc, python-arch: x64, test: full }
+          # DigSim's dependencies don't load on Windows arm64 (importing digsim exits with 127)
+          - { name: windows-arm64, os: windows-11-arm, target: aarch64, rust: aarch64-pc-windows-msvc, python-arch: arm64, test: import }
+          - { name: macos-arm64, os: macos-latest, target: aarch64, rust: aarch64-apple-darwin, python-arch: arm64, test: full }
           # Cross-compiled on the arm64 runner, not tested
           - { name: macos-x86_64, os: macos-latest, target: x86_64, rust: x86_64-apple-darwin, python-arch: arm64 }
     steps:
@@ -71,26 +73,32 @@ jobs:
           path: dist/*.whl
 
       - uses: actions/setup-python@v7
-        if: matrix.test && runner.os == 'Linux'
+        if: matrix.test == 'full' && runner.os == 'Linux'
         with:
           python-version: "3.13"
 
+      - name: Import
+        if: matrix.test == 'import'
+        shell: bash
+        run: |
+          python -m pip install dist/*.whl
+          python -c "import digsim_native; digsim_native.Engine"
+
       - uses: actions/checkout@v7
-        if: matrix.test
+        if: matrix.test == 'full'
         with:
           repository: freand76/digsim
           ref: ${{ env.DIGSIM_REF }}
           path: digsim
 
       - name: Test with DigSim
-        if: matrix.test
+        if: matrix.test == 'full'
         shell: bash
         working-directory: digsim
         run: |
           python -m pip install --upgrade pip
           python -m pip install ../dist/*.whl . "pytest==9.1.1"
-          python -X faulthandler -c "import digsim_native; print(digsim_native.__file__)"
-          python -X faulthandler -c "from digsim.circuit import _native; assert _native.mode() == 'native'"
+          python -c "from digsim.circuit import _native; assert _native.mode() == 'native'"
           python -m pytest -q
 
   release:
