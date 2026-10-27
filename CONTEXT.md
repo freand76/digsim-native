@@ -111,9 +111,9 @@ Cycles per second, Python 3.15, x86_64:
 | --- | ---: | ---: |
 | 6502, gates | 977 | 10,208 |
 | 6502, functional | 1,326 | 13,448 |
-| rv32i, gates | 117 | 1,626 |
-| rv32imc, gates | about 30 | 306 |
-| rv32i, functional | 603 | 6,300 |
+| rv32i, gates | 120 | 1,516 |
+| rv32imc, gates | 23 | 303 |
+| rv32i, functional | 590 | 6,256 |
 
 Writing a VCD file of every port (`--signals`) is Python and takes most of the time, the
 gain is then much smaller.
