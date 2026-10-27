@@ -116,4 +116,7 @@ jobs:
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.whl --title "$GITHUB_REF_NAME" --notes "Install: pip install digsim-native==${GITHUB_REF_NAME#v} --find-links https://github.com/${{ github.repository }}/releases/expanded_assets/$GITHUB_REF_NAME"
+        run: |
+          links="https://github.com/$GITHUB_REPOSITORY/releases/expanded_assets/$GITHUB_REF_NAME"
+          gh release create "$GITHUB_REF_NAME" dist/*.whl --title "$GITHUB_REF_NAME" \
+            --notes "pip install digsim-native==${GITHUB_REF_NAME#v} --find-links $links"
