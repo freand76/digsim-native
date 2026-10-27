@@ -40,5 +40,8 @@ The tests are in DigSim (its pytest, and `tools/native/`).
 1. Bump `version` in `Cargo.toml` and `pyproject.toml`, and the pin in DigSim.
 2. Push a tag `vX.Y.Z`. The `Wheels` workflow builds and tests the wheels and attaches
    them to a release.
+3. To upload them to PyPI: `gh workflow run pypi.yaml -f tag=vX.Y.Z`. PyPI trusts the
+   workflow (Trusted Publishing: publisher `freand76/digsim-native`, workflow
+   `pypi.yaml`, environment `pypi`), so it needs no token.
 
 The interface to DigSim isn't stable, so DigSim pins the version it was written for.
