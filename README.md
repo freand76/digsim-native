@@ -7,13 +7,13 @@ netlists.
 
 ## Install
 
-The wheels are on the [releases](https://github.com/freand76/digsim-native/releases), one
-per platform for every Python from 3.11: Linux x86_64 and aarch64 (glibc and musl),
-Windows x64 and arm64, macOS arm64 and x86_64.
+The wheels are on [PyPI](https://pypi.org/project/digsim-native/) and the
+[releases](https://github.com/freand76/digsim-native/releases), one per platform for every
+Python from 3.11: Linux x86_64 and aarch64 (glibc and musl), Windows x64 and arm64, macOS
+arm64 and x86_64.
 
 ```sh
-pip install digsim-native==0.1.0 \
-    --find-links https://github.com/freand76/digsim-native/releases/expanded_assets/v0.1.0
+pip install digsim-native
 DIGSIM_ENGINE=python python ...     # the Python engine, with the package installed
 ```
 
