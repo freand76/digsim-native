@@ -16,7 +16,7 @@ permissions:
 
 env:
   # The DigSim branch that has the engine interface of this version
-  DIGSIM_REF: rust-engine
+  DIGSIM_REF: use-digsim-native
 
 jobs:
   check:
