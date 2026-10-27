@@ -1,19 +1,52 @@
-# Native engine trial
+# digsim-native
 
-A trial of moving the DigSim simulation to Rust (PyO3), as an optional package,
-`digsim_native`, with the Python engine as the fallback. DigSim uses it when it can import
-it, and simulates in Python as before when it can't.
-
-```sh
-native/build.sh                     # build the wheel and install it into ../.venv
-DIGSIM_ENGINE=python uv run ...     # the Python engine (also without the package)
-uv run ...                          # the native engine, when it is installed
-```
+The native simulation engine of [DigSim](https://github.com/freand76/digsim), in Rust
+(PyO3). DigSim uses it when it can import `digsim_native`, and simulates in Python as
+before when it can't.
 
 There are two engines, Python and native, and they give the same results: the same order
-of events, the same output and byte-identical VCD files. The native engine is only faster.
+of events, the same output and byte-identical VCD files. The native engine is only faster,
+about 10x on Yosys netlists.
+
+## Install
+
+The wheels are on the [GitHub releases](https://github.com/freand76/digsim-native/releases),
+one per platform for every Python from 3.11 (abi3): Linux x86_64 and aarch64 (glibc and
+musl), Windows x64 and arm64, macOS arm64 and x86_64.
+
+```sh
+pip install digsim-native==0.1.0 \
+    --find-links https://github.com/freand76/digsim-native/releases/expanded_assets/v0.1.0
+DIGSIM_ENGINE=python python ...     # the Python engine, also with the package installed
+```
+
+Free-threaded Python doesn't load abi3 modules, DigSim then simulates in Python.
+
+## Build
+
+```sh
+pip install maturin
+maturin build --release              # the wheel, in target/wheels/
+pip install target/wheels/*.whl      # into the environment of DigSim
+cargo fmt --check && cargo clippy --release -- -D warnings
+```
+
+The tests are in DigSim: its test suite and the engine comparisons in its
+`tools/native/` run both engines and compare them byte for byte.
+
+## Releases
+
+1. Bump `version` in `Cargo.toml` and `pyproject.toml` (the same version), and the pin
+   in DigSim.
+2. Push a tag `vX.Y.Z`. The `Wheels` workflow builds and tests the wheels and attaches
+   them to a GitHub release of the tag.
+
+The interface between DigSim and the engine (`Engine` and its arguments) isn't stable:
+DigSim pins the version it was written for.
 
 ## The two trials
+
+
 
 **Trial 1, only the engine** (removed): the event queue and the check for stale events in
 Rust, the loop, the ports and all components in Python. The queue is CPython's heapq
@@ -21,7 +54,7 @@ algorithm step by step, so events at the same time keep their order.
 
 **Trial 2, the circuit handling too** (`Engine`): Rust runs the event loop, and simulates
 every Yosys gate cell (the gates, muxes, tristate buffers, flip-flops and latches) and
-functional cell (`native/src/word.rs`: arithmetic, comparisons, shifts, muxes, the
+functional cell (`src/word.rs`: arithmetic, comparisons, shifts, muxes, the
 decoders, flip-flops, latches, `$alu`, `$macc_v2`, `$lut`, `$tribuf` ...), GND and VDD,
 and the bus ports (`PortMultiBitWire` up to 64 bits and their `PortWireBit` bits). A
 one-bit port with several drivers (a tristate bus) gets its value from them in Rust, as
@@ -57,7 +90,7 @@ natively it stays faster: rv32i functional is 5x its gates. Steps on the way:
 - Native functional cells with `num-bigint` values: 4x on the 6502 functional, slower
   than the gates. Every operation allocated, also for 8-bit words, and the parameters
   were looked up by name in each update.
-- A number type that is a `u64` while it fits (`native/src/bits.rs`, `BigUint` only for
+- A number type that is a `u64` while it fits (`src/bits.rs`, `BigUint` only for
   wider words like the 1024-bit register file), arithmetic up to 64 bits in an `i128`,
   and the parameters read once: 10x.
 
@@ -139,21 +172,7 @@ They were left out:
   user components) work unchanged and keep the event order exact, so they can move one
   at a time, when they matter for speed.
 
-## Packaging, with the Python fallback
-
-The Rust part fits as a separate optional package, `digsim-native`, built with maturin:
-
-- The abi3 build (`abi3-py311`) is one wheel per platform for every Python from 3.11, so
-  a release is about 5 wheels (Linux x86_64 and aarch64, macOS x86_64 and arm64, Windows
-  x86_64), built in CI with `maturin-action`.
-- `digsim-logic-simulator` stays a pure Python wheel. It could depend on the native
-  package as an extra, `pip install digsim-logic-simulator[native]`, or depend on it
-  on the platforms with wheels (environment markers), and fall back to Python elsewhere.
-- One package with both, where the Rust extension is optional at build time, is possible
-  too (setuptools-rust with `optional=True`), but then pip builds from the sdist on
-  platforms without a wheel, which needs a Rust compiler or silently falls back.
-
-## Not done in the trial
+## Not done
 
 - A bus port with several drivers (two tristate outputs of components on one bus) is
   resolved in Python. Inside a netlist a tristate bus is resolved per bit, natively.
