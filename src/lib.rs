@@ -342,6 +342,13 @@ struct Inner {
     fast_update: Vec<Option<Py<PyAny>>>,
     // Setting a bus: its bits update the buses they are in at the end
     bus_batch: u32,
+    // A bus whose bits are the input bits of a slot of a block: (block, slot, first),
+    // set as one word. Bit i of it has the pin bus_pins[first + i] (u32::MAX for none),
+    // and drives the other ports bus_others[bus_other_start[first + i]..[first + i + 1]].
+    bus_block: Vec<Option<(u32, u32, u32)>>,
+    bus_pins: Vec<u32>,
+    bus_other_start: Vec<u32>,
+    bus_others: Vec<u32>,
 }
 
 impl Inner {
@@ -364,6 +371,62 @@ impl Inner {
         if !self.in_settle {
             self.schedule_settle();
         }
+    }
+
+    /// The buses that set one input slot of a block (see bus_block)
+    fn find_bus_blocks(&mut self) {
+        let mut found = Vec::with_capacity(self.buses.len());
+        for b in 0..self.buses.len() {
+            let bus = &self.buses[b];
+            let count = bus.bits.len();
+            let mut target: Option<(u32, u32)> = None;
+            let mut ok = count > 0 && count <= 64;
+            let mut pins = vec![u32::MAX; count];
+            let mut others: Vec<Vec<u32>> = vec![Vec::new(); count];
+            for (index, &bit) in bus.bits.iter().enumerate() {
+                let b = bit as usize;
+                if !ok || self.driver_start[b] != self.driver_start[b + 1] {
+                    ok = false;
+                    break;
+                }
+                let (start, end) = (
+                    self.wired_start[b] as usize,
+                    self.wired_start[b + 1] as usize,
+                );
+                for &port in &self.wired_targets[start..end] {
+                    let p = port as usize;
+                    if self.kind[p] != BLOCK_PIN {
+                        others[index].push(port);
+                        continue;
+                    }
+                    let (slot, bit_index) = self.block_bits[self.aux[p] as usize];
+                    let block = self.owner[p];
+                    let same = target.is_none_or(|t| t == (block, slot));
+                    if pins[index] != u32::MAX || bit_index as usize != index || !same {
+                        ok = false;
+                        break;
+                    }
+                    target = Some((block, slot));
+                    pins[index] = port;
+                }
+            }
+            let result = match target {
+                Some((block, slot))
+                    if ok && self.blocks[block as usize].slot_width(slot) as usize == count =>
+                {
+                    let first = self.bus_pins.len() as u32;
+                    self.bus_pins.extend_from_slice(&pins);
+                    for list in others {
+                        self.bus_others.extend_from_slice(&list);
+                        self.bus_other_start.push(self.bus_others.len() as u32);
+                    }
+                    Some((block, slot, first))
+                }
+                _ => None,
+            };
+            found.push(result);
+        }
+        self.bus_block = found;
     }
 
     /// A block that needs a settle: in this one if it didn't settle in it yet
@@ -1266,6 +1329,9 @@ impl<'a, 'py> Ctx<'a, 'py> {
     fn set_bus(&mut self, port: u32, value: BusValue) -> PyResult<()> {
         let bus = self.st().owner[port as usize] as usize;
         let count = self.st().buses[bus].bits.len();
+        if self.st().bus_block.get(bus).is_some_and(|b| b.is_some()) {
+            return self.set_bus_block(port, bus, value);
+        }
         // The buses that the bits change get their new values once, after all bits
         self.st().bus_batch += 1;
         let mut result = Ok(());
@@ -1295,6 +1361,91 @@ impl<'a, 'py> Ctx<'a, 'py> {
             }
         }
         result
+    }
+
+    /// set_bus() of a bus that sets an input slot of a block: the bits and their pins get
+    /// their values, the block one word, and the bus its value
+    fn set_bus_block(&mut self, port: u32, bus: usize, value: BusValue) -> PyResult<()> {
+        let st = self.st();
+        let (block, slot, first) = st.bus_block[bus].unwrap();
+        let first = first as usize;
+        let count = st.buses[bus].bits.len();
+        let mut changed_bits = 0u64;
+        let (mut v, mut x) = (0u64, 0u64);
+        let mut changed = false;
+        for i in 0..count {
+            let pin = st.bus_pins[first + i];
+            let code = match value {
+                BusValue::Int(n) => ((n >> i) & 1) as u8,
+                BusValue::Code(c) => c,
+            };
+            match code {
+                0 => {}
+                1 => v |= 1 << i,
+                _ => x |= 1 << i,
+            }
+            let bit = st.buses[bus].bits[i] as usize;
+            if st.value[bit] != code {
+                st.value[bit] = code;
+                if pin != u32::MAX {
+                    st.value[pin as usize] = code;
+                }
+                changed = true;
+                changed_bits |= 1 << i;
+            }
+        }
+        if !changed {
+            return Ok(());
+        }
+        if st.blocks[block as usize].set_input_word(slot, v, x) {
+            st.request_block(block as usize);
+        }
+        // The other ports the bits drive (like an output of the module), in a batch
+        let st = self.st();
+        st.bus_batch += 1;
+        let mut result = Ok(());
+        for i in 0..count {
+            if changed_bits >> i & 1 == 0 {
+                continue;
+            }
+            let st = self.st();
+            let code = st.value[st.buses[bus].bits[i] as usize];
+            let (start, end) = (
+                st.bus_other_start[first + i],
+                st.bus_other_start[first + i + 1],
+            );
+            for k in start..end {
+                let target = self.st().bus_others[k as usize];
+                if result.is_ok() {
+                    result = self.set_value(target, code);
+                }
+            }
+        }
+        let st = self.st();
+        st.bus_batch -= 1;
+        result?;
+        if st.bus_batch == 0 && !st.in_settle && !st.dirty_buses.is_empty() {
+            let buses = std::mem::take(&mut st.dirty_buses);
+            for &dirty in &buses {
+                let index = st.owner[dirty as usize] as usize;
+                st.bus_dirty[index] = false;
+            }
+            for dirty in buses {
+                self.update_value_from_bits(dirty)?;
+            }
+        }
+        let st = self.st();
+        // The bus of the bits is this one: its value (once, like after all bits)
+        if st.in_settle || st.bus_batch > 0 {
+            let index = bus;
+            if !st.bus_dirty[index] {
+                st.bus_dirty[index] = true;
+                st.dirty_buses.push(port);
+            }
+            Ok(())
+        } else {
+            self.update_value_from_bits(port)
+        }
     }
 
     // Port.update_wires() of a bus port
@@ -1739,7 +1890,7 @@ impl Engine {
             PyString::intern(py, "X").into_any().unbind(),
             PyString::intern(py, "Z").into_any().unbind(),
         ];
-        Ok(Engine {
+        let engine = Engine {
             inner: lock::Lock::new(Inner {
                 time,
                 seq: 0,
@@ -1785,10 +1936,16 @@ impl Engine {
                 fast_py: Vec::new(),
                 fast_update: Vec::new(),
                 bus_batch: 0,
+                bus_block: Vec::new(),
+                bus_pins: Vec::new(),
+                bus_other_start: vec![0],
+                bus_others: Vec::new(),
             }),
             ports: lock::Lock::new(ports),
             values: objects,
-        })
+        };
+        engine.inner.lock().find_bus_blocks();
+        Ok(engine)
     }
 
     #[getter]

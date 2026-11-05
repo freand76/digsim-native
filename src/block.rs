@@ -101,6 +101,8 @@ struct BCell {
     // A combinational gate with up to three inputs: its part of GATE_TABLE, NO_TABLE for
     // the others
     table: u16,
+    // A combinational functional cell of up to 64 bits: its Small, NO for the others
+    small: u32,
     q: u32,
     old_clock: u8,
     gate: Option<GateCell>,
@@ -179,6 +181,7 @@ pub struct Block {
     writes: Vec<word::Write>,
     pub evaluations: u64,
     // A block of gates only: the arrays of the sweep (see prepare_sweep())
+    smalls: Vec<Small>,
     sweep: bool,
     sweep_gates: Vec<SweepGate>,
     // The groups of gate flip-flops on each clock slot: groups[group_start[s]..]
@@ -248,6 +251,7 @@ impl Block {
             sx: Vec::new(),
             writes: Vec::new(),
             evaluations: 0,
+            smalls: Vec::new(),
             sweep: false,
             sweep_gates: Vec::new(),
             group_start: Vec::new(),
@@ -412,6 +416,7 @@ impl Block {
                 _ => NO_TABLE,
             };
             block.cells.push(BCell {
+                small: NO,
                 table,
                 op,
                 first,
@@ -495,8 +500,49 @@ impl Block {
         block.is_triggered = vec![false; block.cells.len()];
         block.is_changed = vec![false; total];
         block.prepare_groups();
+        block.prepare_small();
         block.prepare_sweep();
         block
+    }
+
+    /// The combinational functional cells of up to 64 bits, decoded once (see Small)
+    fn prepare_small(&mut self) {
+        for c in 0..self.ncomb {
+            let cell = &self.cells[c];
+            let Op::Word(kind) = cell.op else {
+                continue;
+            };
+            let (first, count) = (cell.first as usize, cell.count as usize);
+            if !small_kind(kind) || count == 0 || count > 3 {
+                continue;
+            }
+            if cell.extra.as_ref().is_some_and(|e| e.outputs.len() != 1) {
+                continue;
+            }
+            let ins = &self.ins[first..first + count];
+            let y = cell.out;
+            let widths: Vec<u32> = ins.iter().map(|&s| self.width[s as usize]).collect();
+            if self.width[y as usize] > 64 || widths.iter().any(|&w| w > 64) {
+                continue;
+            }
+            let at = |i: usize| ins[i.min(count - 1)];
+            let small = Small {
+                kind,
+                a: self.start[at(0) as usize],
+                b: self.start[at(1) as usize],
+                s: self.start[at(2) as usize],
+                aw: widths[0] as u8,
+                bw: if count > 1 { widths[1] as u8 } else { 0 },
+                yw: self.width[y as usize] as u8,
+                signs: (cell.a_signed as u8)
+                    | (cell.b_signed as u8) << 1
+                    | (cell.b_signed_param as u8) << 2,
+                y: self.start[y as usize],
+                slot: y,
+            };
+            self.cells[c].small = self.smalls.len() as u32;
+            self.smalls.push(small);
+        }
     }
 
     /// The gate flip-flops that only their clock updates, in groups by clock (see
@@ -768,6 +814,10 @@ impl Block {
         slot
     }
 
+    pub fn slot_width(&self, slot: u32) -> u32 {
+        self.width[slot as usize]
+    }
+
     /// A bit of a slot as a value code: 0, 1 or X
     pub fn code(&self, slot: u32, bit: u32) -> u8 {
         if slot == NO {
@@ -817,6 +867,35 @@ impl Block {
         }
         self.fanout_bits(slot, bit, bit + 1);
         self.needs_settle()
+    }
+
+    /// An input word of up to 64 bits from outside the block (bits, undefined bits).
+    /// Returns if the block needs a settle.
+    pub fn set_input_word(&mut self, slot: u32, v: u64, x: u64) -> bool {
+        let base = self.start[slot as usize] as usize;
+        let m = mask(self.width[slot as usize]);
+        let (x, v) = (x & m, v & m & !(x & m));
+        let diff = (self.v[base] ^ v) | (self.x[base] ^ x);
+        if diff == 0 {
+            return false;
+        }
+        self.v[base] = v;
+        self.x[base] = x;
+        self.c1[slot as usize] = if x & 1 != 0 { X } else { (v & 1) as u8 };
+        self.fanout_mask(slot, diff);
+        self.needs_settle()
+    }
+
+    /// The cells that read the bits of diff of a slot of up to 64 bits, see fanout_bits()
+    fn fanout_mask(&mut self, slot: u32, diff: u64) {
+        if diff.count_ones() == 1 {
+            let bit = diff.trailing_zeros();
+            self.fanout_bits(slot, bit, bit + 1);
+            return;
+        }
+        let low = diff.trailing_zeros();
+        let high = 64 - diff.leading_zeros();
+        self.fanout_range(slot, low, high, diff);
     }
 
     /// The registers start at 0, in the next settle (after their delay), and the constants
@@ -874,7 +953,21 @@ impl Block {
 
     /// The cells that read bits lo..hi of a slot: the bits to their operands, then they are
     /// dirty, or a stateful one updates
+    #[inline]
     fn fanout_bits(&mut self, slot: u32, lo: u32, hi: u32) {
+        self.fanout_range(slot, lo, hi, u64::MAX);
+    }
+
+    /// fanout_bits(), and below 64 bits only for the bits of diff
+    fn fanout_range(&mut self, slot: u32, lo: u32, hi: u32, diff: u64) {
+        // The bits first..after of the slot have a bit of diff
+        let touches = |first: u32, after: u32| {
+            if first >= 64 || diff == u64::MAX {
+                return true;
+            }
+            let m = mask(after.min(64) - first) << first;
+            m & diff != 0
+        };
         let s = slot as usize;
         let (group, group_end) = (
             self.group_start[s] as usize,
@@ -911,7 +1004,7 @@ impl Block {
         };
         for k in (first..narrow).chain(from..to) {
             let seg = self.segs[self.scat[k] as usize];
-            if seg.bit + seg.len <= lo || seg.bit >= hi {
+            if seg.bit + seg.len <= lo || seg.bit >= hi || !touches(seg.bit, seg.bit + seg.len) {
                 continue;
             }
             let src = self.start[slot as usize] as usize;
@@ -949,7 +1042,7 @@ impl Block {
         };
         for i in (start..narrow).chain(from..to) {
             let (entry, first, after) = self.fan[i];
-            if after <= lo || first >= hi {
+            if after <= lo || first >= hi || !touches(first, after) {
                 continue;
             }
             let c = (entry >> 2) as usize;
@@ -1029,12 +1122,7 @@ impl Block {
                 let bit = bits.trailing_zeros() as usize;
                 self.dirty[word] = bits & (bits - 1);
                 self.evaluations += 1;
-                let c = word << 6 | bit;
-                let _t = crate::prof::Timer::new(match self.cells[c].op {
-                    Op::Word(k) => 128 + k as usize,
-                    _ => 70,
-                });
-                self.eval_comb(c);
+                self.eval_comb(word << 6 | bit);
             }
             self.low = self.dirty.len();
             if self.evaluations != before {
@@ -1187,6 +1275,39 @@ impl Block {
     }
 
     fn eval_comb(&mut self, c: usize) {
+        let small = self.cells[c].small;
+        if small != NO {
+            let m = self.smalls[small as usize];
+            let operand =
+                |w: u32, width: u8| (self.v[w as usize], self.x[w as usize], width as u32);
+            let s = (self.v[m.s as usize], self.x[m.s as usize]);
+            let Some((v, x)) = small_op(
+                m.kind,
+                operand(m.a, m.aw),
+                operand(m.b, m.bw),
+                s,
+                m.yw as u32,
+                m.signs & 1 != 0,
+                m.signs & 2 != 0,
+                m.signs & 4 != 0,
+            ) else {
+                return self.slow(c);
+            };
+            let ym = mask(m.yw as u32);
+            let x = x & ym;
+            let v = v & ym & !x;
+            let y = m.y as usize;
+            let diff = (self.v[y] ^ v) | (self.x[y] ^ x);
+            if diff == 0 {
+                return;
+            }
+            self.v[y] = v;
+            self.x[y] = x;
+            self.c1[m.slot as usize] = if x & 1 != 0 { X } else { (v & 1) as u8 };
+            self.mark_changed(m.slot);
+            self.fanout_mask(m.slot, diff);
+            return;
+        }
         self.gather(c);
         let table = self.cells[c].table;
         if table != NO_TABLE {
@@ -1207,7 +1328,7 @@ impl Block {
             self.v[base] = (value == 1) as u64;
             self.x[base] = (value > 1) as u64;
             self.mark_changed(output);
-            self.fanout(output);
+            self.fanout_bits(output, 0, 1);
             return;
         }
         let output = self.cells[c].out;
@@ -1635,231 +1756,38 @@ impl Block {
         } else {
             (0, 0, 0)
         };
-        let (v, x): (u64, u64) = match kind {
-            W::Not | W::Pos | W::Neg => {
-                let (v, x) = extend(av, ax, aw, a_signed, yw);
-                match kind {
-                    W::Not => (!v & !x & ym, x),
-                    W::Pos => (v, x),
-                    _ => {
-                        if x != 0 {
-                            (0, ym)
-                        } else {
-                            (v.wrapping_neg() & ym, 0)
-                        }
-                    }
-                }
-            }
-            W::And | W::Or | W::Xor | W::Xnor => {
-                let signed = a_signed && b_signed;
-                let (av, ax) = extend(av, ax, aw, signed, yw);
-                let (bv, bx) = extend(bv, bx, bw, signed, yw);
-                bitwise(kind, av, ax, bv, bx, ym)
-            }
-            W::ReduceAnd | W::ReduceOr | W::ReduceXor | W::ReduceXnor | W::LogicNot => {
-                let am = mask(aw);
-                let r = match kind {
-                    W::ReduceAnd => {
-                        if !(av | ax) & am != 0 {
-                            Some(0)
-                        } else if ax != 0 {
-                            None
-                        } else {
-                            Some(1)
-                        }
-                    }
-                    W::ReduceOr => reduce_or(av, ax),
-                    W::ReduceXor | W::ReduceXnor => {
-                        if ax != 0 {
-                            None
-                        } else {
-                            let parity = (av.count_ones() & 1) as u64;
-                            Some(if kind == W::ReduceXor {
-                                parity
-                            } else {
-                                1 - parity
-                            })
-                        }
-                    }
-                    _ => reduce_or(av, ax).map(|r| 1 - r),
-                };
-                match r {
-                    None => (0, 1),
-                    Some(r) => (r, 0),
-                }
-            }
-            W::LogicAnd | W::LogicOr => {
-                let (a, b) = (reduce_or(av, ax), reduce_or(bv, bx));
-                let r = if kind == W::LogicAnd {
-                    if a == Some(0) || b == Some(0) {
-                        Some(0)
-                    } else if a == Some(1) && b == Some(1) {
-                        Some(1)
-                    } else {
-                        None
-                    }
-                } else if a == Some(1) || b == Some(1) {
-                    Some(1)
-                } else if a == Some(0) && b == Some(0) {
-                    Some(0)
-                } else {
-                    None
-                };
-                match r {
-                    None => (0, 1),
-                    Some(r) => (r, 0),
-                }
-            }
-            W::Lt | W::Le | W::Gt | W::Ge => {
-                if ax != 0 || bx != 0 {
-                    (0, 1)
-                } else {
-                    let signed = a_signed && b_signed;
-                    let (a, b) = (number(av, aw, signed), number(bv, bw, signed));
-                    let r = match kind {
-                        W::Lt => a < b,
-                        W::Le => a <= b,
-                        W::Gt => a > b,
-                        _ => a >= b,
-                    };
-                    (r as u64, 0)
-                }
-            }
-            W::Eq | W::Ne => {
-                let equal = (kind == W::Eq) as u64;
-                if ax == 0 && bx == 0 && aw == bw {
-                    (if av == bv { equal } else { 1 - equal }, 0)
-                } else {
-                    let width = aw.max(bw).max(yw);
-                    if width > 64 {
+        let s3 = if input_count > 2 {
+            let (sv, sx, _) = self.small(inputs[2]);
+            (sv, sx)
+        } else {
+            (0, 0)
+        };
+        if kind == W::Decoder {
+            let (v, x) = match kind {
+                W::Decoder => {
+                    let extra = self.cells[c].extra.as_ref().unwrap();
+                    if ax != 0 || yw > 64 || extra.word.values.len() as u32 != yw {
                         return None;
                     }
-                    let signed = a_signed && b_signed;
-                    let (av, ax) = extend(av, ax, aw, signed, width);
-                    let (bv, bx) = extend(bv, bx, bw, signed, width);
-                    let m = mask(width);
-                    let (a1, a0) = (av & !ax & m, !(av | ax) & m);
-                    let (b1, b0) = (bv & !bx & m, !(bv | bx) & m);
-                    if (a1 & b0) | (a0 & b1) != 0 {
-                        (1 - equal, 0)
-                    } else if ax | bx != 0 {
-                        (0, 1)
-                    } else {
-                        (equal, 0)
+                    if extra.flips.is_empty() && !extra.word.values.is_empty() {
+                        return None;
                     }
+                    (extra.none ^ extra.flips.get(&av).copied().unwrap_or(0), 0)
                 }
-            }
-            W::Eqx | W::Nex => {
-                let width = aw.max(bw).max(yw);
-                if width > 64 {
-                    return None;
-                }
-                let signed = a_signed && b_signed;
-                let a = extend(av, ax, aw, signed, width);
-                let b = extend(bv, bx, bw, signed, width);
-                let equal = (a == b) as u64;
-                (if kind == W::Eqx { equal } else { 1 - equal }, 0)
-            }
-            W::Add | W::Sub | W::Mul => {
-                if ax != 0 || bx != 0 {
-                    (0, ym)
-                } else {
-                    let signed = a_signed && b_signed;
-                    let (a, b) = (number(av, aw, signed) as u64, number(bv, bw, signed) as u64);
-                    let r = match kind {
-                        W::Add => a.wrapping_add(b),
-                        W::Sub => a.wrapping_sub(b),
-                        _ => a.wrapping_mul(b),
-                    };
-                    (r & ym, 0)
-                }
-            }
-            W::Shl | W::Shr | W::Sshr | W::Shift => {
-                if bx != 0 {
-                    (0, ym)
-                } else {
-                    let width = aw.max(yw);
-                    let (v, x) = extend(av, ax, aw, a_signed, width);
-                    let amount: i128 = if kind == W::Shift && b_signed_p {
-                        number(bv, bw, true)
-                    } else {
-                        bv as i128
-                    };
-                    let left = |amount: i128| -> (u64, u64) {
-                        if amount >= width as i128 {
-                            (0, 0)
-                        } else {
-                            (v << amount, x << amount)
-                        }
-                    };
-                    let right = |amount: i128, fill: (u64, u64)| -> (u64, u64) {
-                        let amount = amount.min(width as i128) as u32;
-                        let fill_mask = mask(width) & !mask(width - amount);
-                        let shift = |w: u64| if amount >= 64 { 0 } else { w >> amount };
-                        (
-                            shift(v) | if fill.0 != 0 { fill_mask } else { 0 },
-                            shift(x) | if fill.1 != 0 { fill_mask } else { 0 },
-                        )
-                    };
-                    let (v, x) = match kind {
-                        W::Shl => left(amount),
-                        W::Shr => right(amount, (0, 0)),
-                        W::Sshr => {
-                            let sign = if a_signed && width > 0 {
-                                ((v >> (width - 1)) & 1, (x >> (width - 1)) & 1)
-                            } else {
-                                (0, 0)
-                            };
-                            right(amount, sign)
-                        }
-                        _ => {
-                            if amount >= 0 {
-                                right(amount, (0, 0))
-                            } else {
-                                left(-amount)
-                            }
-                        }
-                    };
-                    (v & ym, x & ym)
-                }
-            }
-            W::Mux => {
-                let (sv, sx, _) = self.small(inputs[2]);
-                if sx & 1 == 0 {
-                    if sv & 1 != 0 {
-                        (bv, bx)
-                    } else {
-                        (av, ax)
-                    }
-                } else {
-                    let same = !(av ^ bv) & !ax & !bx & ym;
-                    (av & same, ym & !same)
-                }
-            }
-            W::Bwmux => {
-                let (sv, sx, _) = self.small(inputs[2]);
-                let value = (av & !sv) | (bv & sv);
-                let undefined = (ax & !sv) | (bx & sv);
-                let same = !(av ^ bv) & !ax & !bx;
-                let undefined = (undefined & !sx) | (sx & !same);
-                (value & !undefined & ym, undefined & ym)
-            }
-            W::Bweqx => {
-                let differ = (av ^ bv) | (ax ^ bx);
-                (!differ & ym, 0)
-            }
-            W::Decoder => {
-                let extra = self.cells[c].extra.as_ref().unwrap();
-                if ax != 0 || yw > 64 || extra.word.values.len() as u32 != yw {
-                    return None;
-                }
-                if extra.flips.is_empty() && !extra.word.values.is_empty() {
-                    return None;
-                }
-                (extra.none ^ extra.flips.get(&av).copied().unwrap_or(0), 0)
-            }
-            _ => return None,
-        };
+                _ => return None,
+            };
+            return Some(self.write_small(output, v, x));
+        }
+        let (v, x) = small_op(
+            kind,
+            (av, ax, aw),
+            (bv, bx, bw),
+            s3,
+            yw,
+            a_signed,
+            b_signed,
+            b_signed_p,
+        )?;
         Some(self.write_small(output, v, x))
     }
 
@@ -1980,6 +1908,62 @@ struct EdgeGroup {
     end: u32,
 }
 
+/// A combinational functional cell of up to 64 bits, decoded: the words of its operands
+/// (A, B, S) and of Y in Block.v and x, their widths, A_SIGNED, B_SIGNED (both for the
+/// operations that are signed only if both are) and B_SIGNED alone, and the slot of Y
+#[derive(Clone, Copy)]
+struct Small {
+    kind: W,
+    a: u32,
+    b: u32,
+    s: u32,
+    aw: u8,
+    bw: u8,
+    yw: u8,
+    signs: u8,
+    y: u32,
+    slot: u32,
+}
+
+/// The kinds small_op() computes
+fn small_kind(kind: W) -> bool {
+    use W::*;
+    matches!(
+        kind,
+        Not | Pos
+            | Neg
+            | And
+            | Or
+            | Xor
+            | Xnor
+            | ReduceAnd
+            | ReduceOr
+            | ReduceXor
+            | ReduceXnor
+            | LogicNot
+            | LogicAnd
+            | LogicOr
+            | Lt
+            | Le
+            | Gt
+            | Ge
+            | Eq
+            | Ne
+            | Eqx
+            | Nex
+            | Add
+            | Sub
+            | Mul
+            | Shl
+            | Shr
+            | Sshr
+            | Shift
+            | Mux
+            | Bwmux
+            | Bweqx
+    )
+}
+
 /// A gate of a sweep: its inputs (up to three), output and part of GATE_TABLE
 #[derive(Clone, Copy)]
 struct SweepGate {
@@ -2040,6 +2024,239 @@ fn gate_table() -> &'static [u8] {
         }
         table
     })
+}
+
+/// A combinational cell of up to 64 bits (the operands and Y): its Y, None if it isn't
+/// one of these. a and b are (bits, undefined bits, width), s the select input.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn small_op(
+    kind: W,
+    (av, ax, aw): (u64, u64, u32),
+    (bv, bx, bw): (u64, u64, u32),
+    s: (u64, u64),
+    yw: u32,
+    a_signed: bool,
+    b_signed: bool,
+    b_signed_p: bool,
+) -> Option<(u64, u64)> {
+    let ym = mask(yw);
+    let (v, x): (u64, u64) = match kind {
+        W::Not | W::Pos | W::Neg => {
+            let (v, x) = extend(av, ax, aw, a_signed, yw);
+            match kind {
+                W::Not => (!v & !x & ym, x),
+                W::Pos => (v, x),
+                _ => {
+                    if x != 0 {
+                        (0, ym)
+                    } else {
+                        (v.wrapping_neg() & ym, 0)
+                    }
+                }
+            }
+        }
+        W::And | W::Or | W::Xor | W::Xnor => {
+            let signed = a_signed && b_signed;
+            let (av, ax) = extend(av, ax, aw, signed, yw);
+            let (bv, bx) = extend(bv, bx, bw, signed, yw);
+            bitwise(kind, av, ax, bv, bx, ym)
+        }
+        W::ReduceAnd | W::ReduceOr | W::ReduceXor | W::ReduceXnor | W::LogicNot => {
+            let am = mask(aw);
+            let r = match kind {
+                W::ReduceAnd => {
+                    if !(av | ax) & am != 0 {
+                        Some(0)
+                    } else if ax != 0 {
+                        None
+                    } else {
+                        Some(1)
+                    }
+                }
+                W::ReduceOr => reduce_or(av, ax),
+                W::ReduceXor | W::ReduceXnor => {
+                    if ax != 0 {
+                        None
+                    } else {
+                        let parity = (av.count_ones() & 1) as u64;
+                        Some(if kind == W::ReduceXor {
+                            parity
+                        } else {
+                            1 - parity
+                        })
+                    }
+                }
+                _ => reduce_or(av, ax).map(|r| 1 - r),
+            };
+            match r {
+                None => (0, 1),
+                Some(r) => (r, 0),
+            }
+        }
+        W::LogicAnd | W::LogicOr => {
+            let (a, b) = (reduce_or(av, ax), reduce_or(bv, bx));
+            let r = if kind == W::LogicAnd {
+                if a == Some(0) || b == Some(0) {
+                    Some(0)
+                } else if a == Some(1) && b == Some(1) {
+                    Some(1)
+                } else {
+                    None
+                }
+            } else if a == Some(1) || b == Some(1) {
+                Some(1)
+            } else if a == Some(0) && b == Some(0) {
+                Some(0)
+            } else {
+                None
+            };
+            match r {
+                None => (0, 1),
+                Some(r) => (r, 0),
+            }
+        }
+        W::Lt | W::Le | W::Gt | W::Ge => {
+            if ax != 0 || bx != 0 {
+                (0, 1)
+            } else {
+                let signed = a_signed && b_signed;
+                let (a, b) = (number(av, aw, signed), number(bv, bw, signed));
+                let r = match kind {
+                    W::Lt => a < b,
+                    W::Le => a <= b,
+                    W::Gt => a > b,
+                    _ => a >= b,
+                };
+                (r as u64, 0)
+            }
+        }
+        W::Eq | W::Ne => {
+            let equal = (kind == W::Eq) as u64;
+            if ax == 0 && bx == 0 && aw == bw {
+                (if av == bv { equal } else { 1 - equal }, 0)
+            } else {
+                let width = aw.max(bw).max(yw);
+                if width > 64 {
+                    return None;
+                }
+                let signed = a_signed && b_signed;
+                let (av, ax) = extend(av, ax, aw, signed, width);
+                let (bv, bx) = extend(bv, bx, bw, signed, width);
+                let m = mask(width);
+                let (a1, a0) = (av & !ax & m, !(av | ax) & m);
+                let (b1, b0) = (bv & !bx & m, !(bv | bx) & m);
+                if (a1 & b0) | (a0 & b1) != 0 {
+                    (1 - equal, 0)
+                } else if ax | bx != 0 {
+                    (0, 1)
+                } else {
+                    (equal, 0)
+                }
+            }
+        }
+        W::Eqx | W::Nex => {
+            let width = aw.max(bw).max(yw);
+            if width > 64 {
+                return None;
+            }
+            let signed = a_signed && b_signed;
+            let a = extend(av, ax, aw, signed, width);
+            let b = extend(bv, bx, bw, signed, width);
+            let equal = (a == b) as u64;
+            (if kind == W::Eqx { equal } else { 1 - equal }, 0)
+        }
+        W::Add | W::Sub | W::Mul => {
+            if ax != 0 || bx != 0 {
+                (0, ym)
+            } else {
+                let signed = a_signed && b_signed;
+                let (a, b) = (number(av, aw, signed) as u64, number(bv, bw, signed) as u64);
+                let r = match kind {
+                    W::Add => a.wrapping_add(b),
+                    W::Sub => a.wrapping_sub(b),
+                    _ => a.wrapping_mul(b),
+                };
+                (r & ym, 0)
+            }
+        }
+        W::Shl | W::Shr | W::Sshr | W::Shift => {
+            if bx != 0 {
+                (0, ym)
+            } else {
+                let width = aw.max(yw);
+                let (v, x) = extend(av, ax, aw, a_signed, width);
+                let amount: i128 = if kind == W::Shift && b_signed_p {
+                    number(bv, bw, true)
+                } else {
+                    bv as i128
+                };
+                let left = |amount: i128| -> (u64, u64) {
+                    if amount >= width as i128 {
+                        (0, 0)
+                    } else {
+                        (v << amount, x << amount)
+                    }
+                };
+                let right = |amount: i128, fill: (u64, u64)| -> (u64, u64) {
+                    let amount = amount.min(width as i128) as u32;
+                    let fill_mask = mask(width) & !mask(width - amount);
+                    let shift = |w: u64| if amount >= 64 { 0 } else { w >> amount };
+                    (
+                        shift(v) | if fill.0 != 0 { fill_mask } else { 0 },
+                        shift(x) | if fill.1 != 0 { fill_mask } else { 0 },
+                    )
+                };
+                let (v, x) = match kind {
+                    W::Shl => left(amount),
+                    W::Shr => right(amount, (0, 0)),
+                    W::Sshr => {
+                        let sign = if a_signed && width > 0 {
+                            ((v >> (width - 1)) & 1, (x >> (width - 1)) & 1)
+                        } else {
+                            (0, 0)
+                        };
+                        right(amount, sign)
+                    }
+                    _ => {
+                        if amount >= 0 {
+                            right(amount, (0, 0))
+                        } else {
+                            left(-amount)
+                        }
+                    }
+                };
+                (v & ym, x & ym)
+            }
+        }
+        W::Mux => {
+            let (sv, sx) = (s.0, s.1);
+            if sx & 1 == 0 {
+                if sv & 1 != 0 {
+                    (bv, bx)
+                } else {
+                    (av, ax)
+                }
+            } else {
+                let same = !(av ^ bv) & !ax & !bx & ym;
+                (av & same, ym & !same)
+            }
+        }
+        W::Bwmux => {
+            let (sv, sx) = (s.0, s.1);
+            let value = (av & !sv) | (bv & sv);
+            let undefined = (ax & !sv) | (bx & sv);
+            let same = !(av ^ bv) & !ax & !bx;
+            let undefined = (undefined & !sx) | (sx & !same);
+            (value & !undefined & ym, undefined & ym)
+        }
+        W::Bweqx => {
+            let differ = (av ^ bv) | (ax ^ bx);
+            (!differ & ym, 0)
+        }
+        _ => return None,
+    };
+    Some((v, x))
 }
 
 fn is_fast_register(kind: W) -> bool {
