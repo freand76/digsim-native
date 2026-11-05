@@ -340,8 +340,10 @@ struct Inner {
     // parent, in fast_update), 2 a plain PortWire
     fast_py: Vec<u8>,
     fast_update: Vec<Option<Py<PyAny>>>,
-    // Setting a bus: its bits update the buses they are in at the end
+    // Setting a bus: its bits update the buses they are in at the end (with levels, without
+    // them every bit updates its bus, like in Python)
     bus_batch: u32,
+    batch_buses: bool,
     // A bus whose bits are the input bits of a slot of a block: (block, slot, first),
     // set as one word. Bit i of it has the pin bus_pins[first + i] (u32::MAX for none),
     // and drives the other ports bus_others[bus_other_start[first + i]..[first + i + 1]].
@@ -1333,7 +1335,8 @@ impl<'a, 'py> Ctx<'a, 'py> {
             return self.set_bus_block(port, bus, value);
         }
         // The buses that the bits change get their new values once, after all bits
-        self.st().bus_batch += 1;
+        let batch = self.st().batch_buses as u32;
+        self.st().bus_batch += batch;
         let mut result = Ok(());
         for i in 0..count {
             let bit = self.st().buses[bus].bits[i];
@@ -1347,7 +1350,7 @@ impl<'a, 'py> Ctx<'a, 'py> {
             }
         }
         let st = self.st();
-        st.bus_batch -= 1;
+        st.bus_batch -= batch;
         if st.bus_batch == 0 && !st.in_settle {
             let buses = std::mem::take(&mut st.dirty_buses);
             for &dirty in &buses {
@@ -1815,6 +1818,7 @@ impl Engine {
         time: i64,
         blocks: Vec<BlockArgs>,
         block_bits: Vec<(u32, u32)>,
+        levels: bool,
     ) -> PyResult<Self> {
         let mut compiled = Vec::with_capacity(blocks.len());
         for args in blocks {
@@ -1867,16 +1871,21 @@ impl Engine {
             });
         }
         let ngates = native_cells.len();
-        let rank = cell_ranks(
-            &kinds,
-            &owners,
-            &wired_start,
-            &wired_targets,
-            &delays,
-            &native_cells,
-            &native_buses,
-            &word_cells,
-        );
+        // Without levels every cell has its events and delay, like the Python engine
+        let rank = if levels {
+            cell_ranks(
+                &kinds,
+                &owners,
+                &wired_start,
+                &wired_targets,
+                &delays,
+                &native_cells,
+                &native_buses,
+                &word_cells,
+            )
+        } else {
+            vec![levels::NONE; native_cells.len() + word_cells.len()]
+        };
         let depth = rank
             .iter()
             .filter(|&&r| r != levels::NONE)
@@ -1936,6 +1945,7 @@ impl Engine {
                 fast_py: Vec::new(),
                 fast_update: Vec::new(),
                 bus_batch: 0,
+                batch_buses: levels,
                 bus_block: Vec::new(),
                 bus_pins: Vec::new(),
                 bus_other_start: vec![0],

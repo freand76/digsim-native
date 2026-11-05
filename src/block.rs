@@ -145,7 +145,9 @@ pub struct Block {
     // (the slot is an input that updates a stateful cell)
     fan_start: Vec<u32>,
     // (entry, the first bit it reads, the bit after the last one)
-    fan: Vec<(u32, u32, u32)>,
+    // (entry, the first bit it reads, the bit after the last one, the bits it reads of a
+    // slot of up to 64 bits; 0 for a wider one, then it reads all bits first..after)
+    fan: Vec<(u32, u32, u32, u64)>,
     // Where the readers of one bit of each slot start in fan
     fan_narrow: Vec<u32>,
     // The segs that copy bits of each slot into operands: scat[scat_start[s]..]
@@ -172,12 +174,15 @@ pub struct Block {
     in_comb: bool,
     triggered: Vec<u32>,
     is_triggered: Vec<bool>,
-    updated: Vec<u32>,
+    updated: Vec<(u32, u64)>,
+    wide_diffs: Vec<Vec<u64>>,
     changed: Vec<u32>,
     is_changed: Vec<bool>,
     // Scratch words for results
     sv: Vec<u64>,
     sx: Vec<u64>,
+    // The bits that the last write of a slot changed, by word (see fanout_changed())
+    diff: Vec<u64>,
     writes: Vec<word::Write>,
     pub evaluations: u64,
     // A block of gates only: the arrays of the sweep (see prepare_sweep())
@@ -245,10 +250,12 @@ impl Block {
             triggered: Vec::new(),
             is_triggered: Vec::new(),
             updated: Vec::new(),
+            wide_diffs: Vec::new(),
             changed: Vec::new(),
             is_changed: Vec::new(),
             sv: Vec::new(),
             sx: Vec::new(),
+            diff: vec![0],
             writes: Vec::new(),
             evaluations: 0,
             smalls: Vec::new(),
@@ -265,7 +272,7 @@ impl Block {
             block.add_slot(width);
         }
         let slots = block.width.len();
-        let mut readers: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); slots];
+        let mut readers: Vec<Vec<(u32, u32, u32, u64)>> = vec![Vec::new(); slots];
         // The combinational cells by rank, then the stateful ones
         let mut order: Vec<usize> = (0..cells.len()).collect();
         order.sort_by_key(|&i| (cells[i].rank == NO, cells[i].rank));
@@ -330,19 +337,35 @@ impl Block {
                 let stateful = args.rank == NO;
                 // A stateful reader, and if the input updates it
                 let flag = (stateful as u32) << 1 | (stateful && *update) as u32;
-                // The bits it reads of each slot
-                let mut sources: Vec<(u32, u32, u32)> = Vec::new();
+                // The bits it reads of each slot: a mask of a slot of up to 64 bits, the
+                // runs of bits of a wider one
+                let mut sources: Vec<(u32, Vec<u32>)> = Vec::new();
                 for &(source, bit) in bits.iter().filter(|b| b.0 != NO) {
                     match sources.iter_mut().find(|s| s.0 == source) {
-                        Some(range) => {
-                            range.1 = range.1.min(bit);
-                            range.2 = range.2.max(bit + 1);
-                        }
-                        None => sources.push((source, bit, bit + 1)),
+                        Some(found) => found.1.push(bit),
+                        None => sources.push((source, vec![bit])),
                     }
                 }
-                for (source, lo, hi) in sources {
-                    readers[source as usize].push(((number as u32) << 2 | flag, lo, hi));
+                let entry = (number as u32) << 2 | flag;
+                for (source, mut read) in sources {
+                    read.sort_unstable();
+                    read.dedup();
+                    let list = &mut readers[source as usize];
+                    if block.width[source as usize] <= 64 {
+                        let mask = read.iter().fold(0u64, |m, &b| m | 1 << b);
+                        list.push((entry, read[0], read[read.len() - 1] + 1, mask));
+                        continue;
+                    }
+                    let mut first = read[0];
+                    let mut last = read[0];
+                    for &bit in &read[1..] {
+                        if bit != last + 1 {
+                            list.push((entry, first, last + 1, 0));
+                            first = bit;
+                        }
+                        last = bit;
+                    }
+                    list.push((entry, first, last + 1, 0));
                 }
             }
             let stateful = args.rank == NO;
@@ -440,17 +463,40 @@ impl Block {
         for mut list in readers {
             list.sort_unstable();
             list.dedup();
-            // A cell that reads a slot both as an updating and a plain input updates
-            let mut merged: Vec<(u32, u32, u32)> = Vec::new();
-            for entry in list {
-                match merged.last_mut() {
-                    Some(last) if last.0 >> 2 == entry.0 >> 2 => {
-                        last.0 |= entry.0 & 3;
-                        last.1 = last.1.min(entry.1);
-                        last.2 = last.2.max(entry.2);
+            // A cell that reads a slot both as an updating and a plain input updates: the
+            // flags of all entries of a cell, one entry for a slot of up to 64 bits
+            let mut merged: Vec<(u32, u32, u32, u64)> = Vec::new();
+            let mut index = 0;
+            while index < list.len() {
+                let cell = list[index].0 >> 2;
+                let end = index
+                    + list[index..]
+                        .iter()
+                        .take_while(|e| e.0 >> 2 == cell)
+                        .count();
+                let flags = list[index..end].iter().fold(0, |f, e| f | (e.0 & 3));
+                let group = &list[index..end];
+                if group[0].3 != 0 {
+                    let lo = group.iter().map(|e| e.1).min().unwrap();
+                    let hi = group.iter().map(|e| e.2).max().unwrap();
+                    let mask = group.iter().fold(0, |m, e| m | e.3);
+                    merged.push((cell << 2 | flags, lo, hi, mask));
+                } else {
+                    // Runs of a wide slot: merged where they overlap
+                    let mut runs: Vec<(u32, u32)> = group.iter().map(|e| (e.1, e.2)).collect();
+                    runs.sort_unstable();
+                    let mut current = runs[0];
+                    for &(lo, hi) in &runs[1..] {
+                        if lo <= current.1 {
+                            current.1 = current.1.max(hi);
+                        } else {
+                            merged.push((cell << 2 | flags, current.0, current.1, 0));
+                            current = (lo, hi);
+                        }
                     }
-                    _ => merged.push(entry),
+                    merged.push((cell << 2 | flags, current.0, current.1, 0));
                 }
+                index = end;
             }
             // The readers of more than one bit, then those of one bit by the bit (found
             // with a binary search when one bit changes)
@@ -631,7 +677,7 @@ impl Block {
                 self.fan_narrow[slot] as usize,
                 self.fan_start[slot + 1] as usize,
             );
-            let keep = |e: &(u32, u32, u32)| {
+            let keep = |e: &(u32, u32, u32, u64)| {
                 let c = (e.0 >> 2) as usize;
                 !(grouped[c] && self.ins[self.cells[c].first as usize] == slot as u32)
             };
@@ -879,11 +925,36 @@ impl Block {
         if diff == 0 {
             return false;
         }
+        if self.updates_stateful(slot) {
+            // Like Python sets the bits of a bus: one at a time, the lowest first (a
+            // latch can see its data change before its enable)
+            let mut bits = diff;
+            while bits != 0 {
+                let bit = bits.trailing_zeros();
+                bits &= bits - 1;
+                let code = if (x >> bit) & 1 != 0 {
+                    X
+                } else {
+                    ((v >> bit) & 1) as u8
+                };
+                self.set_input(slot, bit, code);
+            }
+            return self.needs_settle();
+        }
         self.v[base] = v;
         self.x[base] = x;
         self.c1[slot as usize] = if x & 1 != 0 { X } else { (v & 1) as u8 };
         self.fanout_mask(slot, diff);
         self.needs_settle()
+    }
+
+    /// Does a slot update a stateful cell (a clock, reset or latch input)
+    fn updates_stateful(&self, slot: u32) -> bool {
+        let s = slot as usize;
+        self.group_start[s] != self.group_start[s + 1]
+            || self.fan[self.fan_start[s] as usize..self.fan_start[s + 1] as usize]
+                .iter()
+                .any(|e| e.0 & 3 == 3)
     }
 
     /// The cells that read the bits of diff of a slot of up to 64 bits, see fanout_bits()
@@ -895,7 +966,7 @@ impl Block {
         }
         let low = diff.trailing_zeros();
         let high = 64 - diff.leading_zeros();
-        self.fanout_range(slot, low, high, diff);
+        self.fanout_range(slot, low, high, diff, None);
     }
 
     /// The registers start at 0, in the next settle (after their delay), and the constants
@@ -926,7 +997,7 @@ impl Block {
                     self.c1[q as usize] = value;
                     if self.copy_slot(q, output) {
                         self.mark_changed(output);
-                        self.fanout(output);
+                        self.fanout_changed(output);
                     }
                 }
                 _ => {
@@ -955,13 +1026,47 @@ impl Block {
     /// dirty, or a stateful one updates
     #[inline]
     fn fanout_bits(&mut self, slot: u32, lo: u32, hi: u32) {
-        self.fanout_range(slot, lo, hi, u64::MAX);
+        self.fanout_range(slot, lo, hi, u64::MAX, None);
     }
 
-    /// fanout_bits(), and below 64 bits only for the bits of diff
-    fn fanout_range(&mut self, slot: u32, lo: u32, hi: u32, diff: u64) {
+    /// The readers of the bits that the last write of a slot changed (Python updates a
+    /// cell only when a bit it reads changes)
+    fn fanout_changed(&mut self, slot: u32) {
+        if self.diff.len() <= 1 {
+            let diff = self.diff.first().copied().unwrap_or(0);
+            if diff != 0 {
+                self.fanout_mask(slot, diff);
+            }
+            return;
+        }
+        let words = std::mem::take(&mut self.diff);
+        let Some(first) = words.iter().position(|&w| w != 0) else {
+            self.diff = words;
+            return;
+        };
+        let last = words.iter().rposition(|&w| w != 0).unwrap();
+        let lo = first as u32 * 64 + words[first].trailing_zeros();
+        let hi = last as u32 * 64 + 64 - words[last].leading_zeros();
+        self.fanout_range(slot, lo, hi, u64::MAX, Some(&words));
+        self.diff = words;
+    }
+
+    /// fanout_bits(), and below 64 bits only for the bits of diff (or of words)
+    fn fanout_range(&mut self, slot: u32, lo: u32, hi: u32, diff: u64, words: Option<&[u64]>) {
         // The bits first..after of the slot have a bit of diff
         let touches = |first: u32, after: u32| {
+            if let Some(words) = words {
+                let mut bit = first;
+                while bit < after {
+                    let (w, o) = ((bit / 64) as usize, bit % 64);
+                    let len = (after - bit).min(64 - o);
+                    if words.get(w).is_some_and(|&d| (d >> o) & mask(len) != 0) {
+                        return true;
+                    }
+                    bit += len;
+                }
+                return false;
+            }
             if first >= 64 || diff == u64::MAX {
                 return true;
             }
@@ -1041,8 +1146,20 @@ impl Block {
             (narrow, end)
         };
         for i in (start..narrow).chain(from..to) {
-            let (entry, first, after) = self.fan[i];
-            if after <= lo || first >= hi || !touches(first, after) {
+            let (entry, first, after, read) = self.fan[i];
+            if after <= lo || first >= hi {
+                continue;
+            }
+            if read != 0 {
+                // A slot of up to 64 bits: the bits it reads
+                let changed = match words {
+                    Some(words) => words.first().copied().unwrap_or(0),
+                    None => diff & mask(hi.min(64)) & !mask(lo.min(64)),
+                };
+                if read & changed == 0 {
+                    continue;
+                }
+            } else if !touches(first, after) {
                 continue;
             }
             let c = (entry >> 2) as usize;
@@ -1160,12 +1277,24 @@ impl Block {
                 let (q, output) = (self.cells[c].q, self.cells[c].out);
                 if self.copy_slot(q, output) {
                     self.mark_changed(output);
-                    updated.push(output);
+                    // The changed bits: of a wide slot in wide_diffs
+                    if self.diff.len() == 1 {
+                        updated.push((output, self.diff[0]));
+                    } else {
+                        updated.push((output, self.wide_diffs.len() as u64));
+                        self.wide_diffs.push(self.diff.clone());
+                    }
                 }
             }
-            for &slot in &updated {
-                self.fanout(slot);
+            for &(slot, diff) in &updated {
+                if self.width[slot as usize] <= 64 {
+                    self.fanout_mask(slot, diff);
+                } else {
+                    self.diff = std::mem::take(&mut self.wide_diffs[diff as usize]);
+                    self.fanout_changed(slot);
+                }
             }
+            self.wide_diffs.clear();
             self.updated = updated;
             crate::prof::add(103, t);
             // pending has the flip-flops that the new outputs clocked, for the next round
@@ -1206,7 +1335,10 @@ impl Block {
         );
         let count = words(self.width[to as usize]) as usize;
         let mut changed = false;
+        self.diff.clear();
         for i in 0..count {
+            self.diff
+                .push((self.v[b + i] ^ self.v[a + i]) | (self.x[b + i] ^ self.x[a + i]));
             if self.v[b + i] != self.v[a + i] || self.x[b + i] != self.x[a + i] {
                 changed = true;
                 self.v[b + i] = self.v[a + i];
@@ -1235,7 +1367,10 @@ impl Block {
         let m = mask(self.width[slot as usize]);
         let x = x & m;
         let v = v & m & !x;
-        if self.v[base] == v && self.x[base] == x {
+        let diff = (self.v[base] ^ v) | (self.x[base] ^ x);
+        self.diff.clear();
+        self.diff.push(diff);
+        if diff == 0 {
             return false;
         }
         self.v[base] = v;
@@ -1250,6 +1385,7 @@ impl Block {
         let width = self.width[slot as usize];
         let count = words(width) as usize;
         let mut changed = false;
+        self.diff.clear();
         for i in 0..count {
             let m = if i + 1 == count {
                 mask(width - 64 * i as u32)
@@ -1258,6 +1394,8 @@ impl Block {
             };
             let x = self.sx[i] & m;
             let v = self.sv[i] & m & !x;
+            self.diff
+                .push((self.v[base + i] ^ v) | (self.x[base + i] ^ x));
             if self.v[base + i] != v || self.x[base + i] != x {
                 changed = true;
                 self.v[base + i] = v;
@@ -1355,7 +1493,7 @@ impl Block {
         };
         if changed {
             self.mark_changed(output);
-            self.fanout(output);
+            self.fanout_changed(output);
         }
     }
 
@@ -1574,7 +1712,7 @@ impl Block {
                 }
             } else if changed {
                 self.mark_changed(slot);
-                self.fanout(slot);
+                self.fanout_changed(slot);
             }
         }
     }
