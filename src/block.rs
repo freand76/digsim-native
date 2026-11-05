@@ -185,6 +185,8 @@ pub struct Block {
     watch: Vec<u8>,
     // A slot updates a stateful cell: a clock, reset or latch input
     stateful_readers: Vec<bool>,
+    // A slot of up to 64 bits that only combinational cells read, without segs or groups
+    simple: Vec<bool>,
     vcd_on: bool,
     // Scratch words for results
     sv: Vec<u64>,
@@ -279,6 +281,7 @@ impl Block {
             is_changed: Vec::new(),
             watch: Vec::new(),
             stateful_readers: Vec::new(),
+            simple: Vec::new(),
             vcd_on: true,
             sv: Vec::new(),
             sx: Vec::new(),
@@ -606,6 +609,16 @@ impl Block {
                         .any(|e| e.0 & 3 == 3)
             })
             .collect();
+        block.simple = (0..block.width.len())
+            .map(|s| {
+                block.width[s] <= 64
+                    && block.group_start[s] == block.group_start[s + 1]
+                    && block.scat_start[s] == block.scat_start[s + 1]
+                    && block.fan[block.fan_start[s] as usize..block.fan_start[s + 1] as usize]
+                        .iter()
+                        .all(|e| e.0 & 2 == 0)
+            })
+            .collect();
         block.prepare_sweep();
         block
     }
@@ -810,6 +823,7 @@ impl Block {
         self.is_changed.push(false);
         self.watch.push(0);
         self.stateful_readers.push(false);
+        self.simple.push(true);
         self.fan_start.push(*self.fan_start.last().unwrap());
         self.fan_narrow.push(*self.fan_narrow.last().unwrap_or(&0));
         self.scat_start.push(*self.scat_start.last().unwrap());
@@ -1094,6 +1108,22 @@ impl Block {
 
     /// The cells that read the bits of diff of a slot of up to 64 bits, see fanout_bits()
     fn fanout_mask(&mut self, slot: u32, diff: u64) {
+        let s = slot as usize;
+        if self.simple[s] {
+            // Only combinational cells read it, the bits in their masks
+            for i in self.fan_start[s] as usize..self.fan_start[s + 1] as usize {
+                let (entry, _, _, read) = self.fan[i];
+                if read & diff != 0 {
+                    let c = (entry >> 2) as usize;
+                    let word = c >> 6;
+                    self.dirty[word] |= 1u64 << (c & 63);
+                    if word < self.low {
+                        self.low = word;
+                    }
+                }
+            }
+            return;
+        }
         if diff.count_ones() == 1 {
             let bit = diff.trailing_zeros();
             self.fanout_bits(slot, bit, bit + 1);
