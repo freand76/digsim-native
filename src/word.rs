@@ -253,6 +253,7 @@ pub const KINDS: [Kind; 66] = {
     ]
 };
 
+#[derive(Clone)]
 pub struct Input {
     pub word: Word,
     pub width: usize,
@@ -260,6 +261,7 @@ pub struct Input {
     pub update: bool,
 }
 
+#[derive(Clone)]
 pub struct Output {
     pub mask: W,
     pub width: usize,
@@ -279,11 +281,13 @@ pub struct Output {
 pub type Link = (usize, Vec<(usize, usize, usize, usize)>);
 
 /// An event of a cell: a bit port and its value, or the word port and its value
+#[derive(Clone)]
 pub enum Write {
     Bit(u32, u8),
     Word(u32, W),
 }
 
+#[derive(Clone)]
 pub struct Cell {
     pub kind: Kind,
     pub inputs: Vec<Input>,

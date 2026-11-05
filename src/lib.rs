@@ -175,6 +175,7 @@ const S: usize = 4;
 const L: usize = 5;
 const AD: usize = 6;
 
+#[derive(Clone)]
 pub(crate) struct Cell {
     kind: Kind,
     // The input ports, in the order of the kind; flip-flops and latches: C, D, E, R, S,
@@ -2247,6 +2248,21 @@ impl Engine {
                 )
             })
             .collect()
+    }
+
+    /// With the feature prof: the calls of a block since its default state again, without
+    /// Python (ns, evaluations, calls), see Block::replay()
+    #[allow(unused_variables)]
+    fn block_replay(&self, block: usize, repeats: usize) -> (u64, u64, usize) {
+        #[cfg(feature = "prof")]
+        {
+            let st = self.inner.lock();
+            st.blocks[block].replay(repeats)
+        }
+        #[cfg(not(feature = "prof"))]
+        {
+            (0, 0, 0)
+        }
     }
 
     /// The time of the next settle, None if there is none

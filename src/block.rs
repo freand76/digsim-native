@@ -84,6 +84,7 @@ enum Op {
     Const(u8),
 }
 
+#[derive(Clone)]
 struct BCell {
     op: Op,
     // The operand slots of the inputs: Block.ins[first..first + count], and their bits to
@@ -117,6 +118,7 @@ struct BCell {
 
 /// What a functional cell has more: the cell of word.rs, all outputs, and for a decoder
 /// the outputs for each value of A
+#[derive(Clone)]
 struct Extra {
     word: word::Cell,
     outputs: Vec<u32>,
@@ -128,6 +130,7 @@ struct Extra {
 /// waits for a settle
 pub type CellState = (Option<(Vec<u64>, Vec<u64>)>, u8, bool);
 
+#[derive(Clone)]
 pub struct Block {
     // The code (0, 1 or X) of bit 0 of each slot, for the one-bit inputs of gates
     c1: Vec<u8>,
@@ -178,6 +181,11 @@ pub struct Block {
     wide_diffs: Vec<Vec<u64>>,
     changed: Vec<u32>,
     is_changed: Vec<bool>,
+    // A slot has pins (1), and output ports inside for the VCD file (2)
+    watch: Vec<u8>,
+    // A slot updates a stateful cell: a clock, reset or latch input
+    stateful_readers: Vec<bool>,
+    vcd_on: bool,
     // Scratch words for results
     sv: Vec<u64>,
     sx: Vec<u64>,
@@ -185,10 +193,17 @@ pub struct Block {
     diff: Vec<u64>,
     writes: Vec<word::Write>,
     pub evaluations: u64,
+    // With the feature prof: the block after default_state() and the calls since, to
+    // time them again without Python (see replay())
+    #[cfg(feature = "prof")]
+    record: Option<(Box<Block>, Vec<Call>)>,
     // A block of gates only: the arrays of the sweep (see prepare_sweep())
     smalls: Vec<Small>,
     sweep: bool,
     sweep_gates: Vec<SweepGate>,
+    // The gates (combinational) that read each slot, for eval_sweep_gate()
+    gate_readers_start: Vec<u32>,
+    gate_readers: Vec<u32>,
     // The groups of gate flip-flops on each clock slot: groups[group_start[s]..]
     group_start: Vec<u32>,
     groups: Vec<EdgeGroup>,
@@ -197,6 +212,15 @@ pub struct Block {
     notify: Vec<u8>,
     // The gates the last settle evaluated without a sweep
     last_evaluations: u64,
+}
+
+/// A call of a block, for replay()
+#[cfg(feature = "prof")]
+#[derive(Clone, Copy)]
+pub enum Call {
+    Input(u32, u32, u8),
+    Word(u32, u64, u64),
+    Settle,
 }
 
 /// A cell of a block from Python
@@ -253,14 +277,21 @@ impl Block {
             wide_diffs: Vec::new(),
             changed: Vec::new(),
             is_changed: Vec::new(),
+            watch: Vec::new(),
+            stateful_readers: Vec::new(),
+            vcd_on: true,
             sv: Vec::new(),
             sx: Vec::new(),
             diff: vec![0],
             writes: Vec::new(),
             evaluations: 0,
+            #[cfg(feature = "prof")]
+            record: None,
             smalls: Vec::new(),
             sweep: false,
             sweep_gates: Vec::new(),
+            gate_readers_start: Vec::new(),
+            gate_readers: Vec::new(),
             group_start: Vec::new(),
             groups: Vec::new(),
             edge_flops: Vec::new(),
@@ -273,6 +304,8 @@ impl Block {
         }
         let slots = block.width.len();
         let mut readers: Vec<Vec<(u32, u32, u32, u64)>> = vec![Vec::new(); slots];
+        // The operand slots by the bits they gather
+        let mut shared: HashMap<Vec<(u32, u32)>, u32> = HashMap::new();
         // The combinational cells by rank, then the stateful ones
         let mut order: Vec<usize> = (0..cells.len()).collect();
         order.sort_by_key(|&i| (cells[i].rank == NO, cells[i].rank));
@@ -295,8 +328,13 @@ impl Block {
                 let slot = if whole {
                     block.gat.push((0, 0));
                     bits[0].0
+                } else if let Some(&slot) = shared.get(bits) {
+                    // The same bits as an operand of another cell: one slot for both
+                    block.gat.push((0, 0));
+                    slot
                 } else {
                     let slot = block.add_slot(bits.len() as u32);
+                    shared.insert(bits.clone(), slot);
                     readers.push(Vec::new());
                     let seg_first = block.segs.len() as u32;
                     let mut index = 0;
@@ -545,8 +583,29 @@ impl Block {
         block.is_pending = vec![false; block.cells.len()];
         block.is_triggered = vec![false; block.cells.len()];
         block.is_changed = vec![false; total];
+        block.watch = (0..total)
+            .map(|s| {
+                let pins = block.pin_start[s] != block.pin_start[s + 1];
+                let vcd = block.vcd_start[s] != block.vcd_start[s + 1];
+                if pins {
+                    1
+                } else if vcd {
+                    2
+                } else {
+                    0
+                }
+            })
+            .collect();
         block.prepare_groups();
         block.prepare_small();
+        block.stateful_readers = (0..block.width.len())
+            .map(|s| {
+                block.group_start[s] != block.group_start[s + 1]
+                    || block.fan[block.fan_start[s] as usize..block.fan_start[s + 1] as usize]
+                        .iter()
+                        .any(|e| e.0 & 3 == 3)
+            })
+            .collect();
         block.prepare_sweep();
         block
     }
@@ -749,6 +808,8 @@ impl Block {
         let zero = self.add_slot(1);
         self.c1[zero as usize] = 0;
         self.is_changed.push(false);
+        self.watch.push(0);
+        self.stateful_readers.push(false);
         self.fan_start.push(*self.fan_start.last().unwrap());
         self.fan_narrow.push(*self.fan_narrow.last().unwrap_or(&0));
         self.scat_start.push(*self.scat_start.last().unwrap());
@@ -795,10 +856,67 @@ impl Block {
             }
             self.notify[slot] = flags;
         }
+        self.gate_readers_start = vec![0];
+        for slot in 0..slots {
+            for i in self.fan_start[slot] as usize..self.fan_start[slot + 1] as usize {
+                let entry = self.fan[i].0;
+                if entry & 2 == 0 {
+                    self.gate_readers.push(entry >> 2);
+                }
+            }
+            self.gate_readers_start.push(self.gate_readers.len() as u32);
+        }
         self.sweep = true;
     }
 
     /// Evaluate all gates (see prepare_sweep())
+    /// A dirty gate of a block of gates only (see prepare_sweep()): its gates that read
+    /// a slot are in gate_readers, the slots with other readers fan out as usual
+    #[inline]
+    fn eval_sweep_gate(&mut self, c: usize) {
+        let gate = self.sweep_gates[c];
+        let table = gate_table();
+        // SAFETY: prepare_sweep() checked the slots and the part of the table
+        let value = unsafe {
+            let c1 = &self.c1;
+            let index = gate.table as usize
+                + ((*c1.get_unchecked(gate.a as usize) as usize) << 4
+                    | (*c1.get_unchecked(gate.b as usize) as usize) << 2
+                    | *c1.get_unchecked(gate.s as usize) as usize);
+            *table.get_unchecked(index)
+        };
+        let o = gate.out as usize;
+        if self.c1[o] == value {
+            return;
+        }
+        self.c1[o] = value;
+        let flags = self.notify[o];
+        if flags != 0 {
+            let base = self.start[o] as usize;
+            self.v[base] = (value == 1) as u64;
+            self.x[base] = (value > 1) as u64;
+            if flags & 1 != 0 {
+                self.mark_changed(o as u32);
+            }
+            if flags & 2 != 0 {
+                self.fanout(o as u32);
+                return;
+            }
+        }
+        let (start, end) = (
+            self.gate_readers_start[o] as usize,
+            self.gate_readers_start[o + 1] as usize,
+        );
+        for i in start..end {
+            let r = self.gate_readers[i] as usize;
+            let word = r >> 6;
+            self.dirty[word] |= 1u64 << (r & 63);
+            if word < self.low {
+                self.low = word;
+            }
+        }
+    }
+
     /// Returns how many gate outputs changed.
     fn sweep_gates(&mut self) -> u64 {
         let table = gate_table();
@@ -896,6 +1014,10 @@ impl Block {
 
     /// An input bit from outside the block. Returns if the block needs a settle.
     pub fn set_input(&mut self, slot: u32, bit: u32, code: u8) -> bool {
+        #[cfg(feature = "prof")]
+        if let Some((_, calls)) = self.record.as_mut() {
+            calls.push(Call::Input(slot, bit, code));
+        }
         let _t = crate::prof::Timer::new(105);
         let base = self.start[slot as usize] as usize;
         let (v, x) = match code {
@@ -918,6 +1040,22 @@ impl Block {
     /// An input word of up to 64 bits from outside the block (bits, undefined bits).
     /// Returns if the block needs a settle.
     pub fn set_input_word(&mut self, slot: u32, v: u64, x: u64) -> bool {
+        #[cfg(feature = "prof")]
+        if let Some((_, calls)) = self.record.as_mut() {
+            calls.push(Call::Word(slot, v, x));
+        }
+        #[cfg(feature = "prof")]
+        let saved = self.record.take();
+        let result = self.set_input_word_now(slot, v, x);
+        #[cfg(feature = "prof")]
+        {
+            self.record = saved;
+        }
+        result
+    }
+
+    fn set_input_word_now(&mut self, slot: u32, v: u64, x: u64) -> bool {
+        let _t = crate::prof::Timer::new(108);
         let base = self.start[slot as usize] as usize;
         let m = mask(self.width[slot as usize]);
         let (x, v) = (x & m, v & m & !(x & m));
@@ -949,12 +1087,9 @@ impl Block {
     }
 
     /// Does a slot update a stateful cell (a clock, reset or latch input)
+    #[inline]
     fn updates_stateful(&self, slot: u32) -> bool {
-        let s = slot as usize;
-        self.group_start[s] != self.group_start[s + 1]
-            || self.fan[self.fan_start[s] as usize..self.fan_start[s + 1] as usize]
-                .iter()
-                .any(|e| e.0 & 3 == 3)
+        self.stateful_readers[slot as usize]
     }
 
     /// The cells that read the bits of diff of a slot of up to 64 bits, see fanout_bits()
@@ -966,12 +1101,77 @@ impl Block {
         }
         let low = diff.trailing_zeros();
         let high = 64 - diff.leading_zeros();
+        let s = slot as usize;
+        let narrow = (self.fan_start[s + 1] - self.fan_narrow[s])
+            .max(self.scat_start[s + 1] - self.scat_narrow[s]);
+        let changes = diff.count_ones();
+        if narrow > 4 * changes {
+            // Many readers of one bit: found for each bit that changed (the operands get
+            // all bits before a cell is evaluated)
+            for (wide, narrow) in [(1, 2), (4, 8)] {
+                self.fanout_part(slot, low, high, diff, None, wide);
+                let mut bits = diff;
+                while bits != 0 {
+                    let bit = bits.trailing_zeros();
+                    bits &= bits - 1;
+                    self.fanout_part(slot, bit, bit + 1, u64::MAX, None, narrow);
+                }
+            }
+            return;
+        }
         self.fanout_range(slot, low, high, diff, None);
     }
 
     /// The registers start at 0, in the next settle (after their delay), and the constants
     /// get their values now (GND and VDD have no delay)
     pub fn default_state(&mut self) {
+        #[cfg(feature = "prof")]
+        {
+            self.record = None;
+        }
+        self.default_state_now();
+        #[cfg(feature = "prof")]
+        {
+            let copy = self.clone();
+            self.record = Some((Box::new(copy), Vec::new()));
+        }
+    }
+
+    /// The calls since default_state() again, from a copy of the block then, repeats
+    /// times: returns the ns they took and the evaluations
+    #[cfg(feature = "prof")]
+    pub fn replay(&self, repeats: usize) -> (u64, u64, usize) {
+        let Some((initial, calls)) = self.record.as_ref() else {
+            return (0, 0, 0);
+        };
+        let mut total = 0;
+        let mut evaluations = 0;
+        let mut out = Vec::new();
+        for _ in 0..repeats {
+            let mut block = (**initial).clone();
+            let start = std::time::Instant::now();
+            for &call in calls {
+                match call {
+                    Call::Input(slot, bit, code) => {
+                        block.set_input(slot, bit, code);
+                    }
+                    Call::Word(slot, v, x) => {
+                        block.set_input_word(slot, v, x);
+                    }
+                    Call::Settle => {
+                        out.clear();
+                        block.settle(&mut out, None);
+                    }
+                }
+            }
+            total += start.elapsed().as_nanos() as u64;
+            evaluations += block.evaluations;
+        }
+        (total, evaluations, calls.len())
+    }
+
+    fn default_state_now(&mut self) {
+        self.vcd_on = true;
         for i in 0..self.literals.len() {
             let (slot, bit, value) = self.literals[i];
             let base = self.start[slot as usize] as usize;
@@ -1053,6 +1253,20 @@ impl Block {
 
     /// fanout_bits(), and below 64 bits only for the bits of diff (or of words)
     fn fanout_range(&mut self, slot: u32, lo: u32, hi: u32, diff: u64, words: Option<&[u64]>) {
+        self.fanout_part(slot, lo, hi, diff, words, 15);
+    }
+
+    /// fanout_range() of parts: the segs of more than one bit (1), of one bit (2), the
+    /// groups and the readers of more than one bit (4), of one bit (8)
+    fn fanout_part(
+        &mut self,
+        slot: u32,
+        lo: u32,
+        hi: u32,
+        diff: u64,
+        words: Option<&[u64]>,
+        part: u8,
+    ) {
         // The bits first..after of the slot have a bit of diff
         let touches = |first: u32, after: u32| {
             if let Some(words) = words {
@@ -1074,32 +1288,17 @@ impl Block {
             m & diff != 0
         };
         let s = slot as usize;
-        let (group, group_end) = (
-            self.group_start[s] as usize,
-            self.group_start[s + 1] as usize,
-        );
-        for g in group..group_end {
-            let level = self.c1[s];
-            if level == self.groups[g].old {
-                continue;
-            }
-            self.groups[g].old = level;
-            if level != self.groups[g].level {
-                continue;
-            }
-            if self.in_comb {
-                self.triggered_groups.push(g as u32);
-            } else {
-                self.eval_group(g);
-            }
-        }
         let (first, narrow, end) = (
             self.scat_start[s] as usize,
             self.scat_narrow[s] as usize,
             self.scat_start[s + 1] as usize,
         );
-        // The segs of more than one bit, and those of the bits lo..hi
-        let (from, to) = if hi.saturating_sub(lo) <= 1 && narrow < end {
+        // The segs of more than one bit (part 1), and those of the bits lo..hi (part 2):
+        // all bits are in the operands before a cell is evaluated
+        let first = if part & 1 != 0 { first } else { narrow };
+        let (from, to) = if part & 2 == 0 {
+            (end, end)
+        } else if hi.saturating_sub(lo) <= 1 && narrow < end {
             let list = &self.scat[narrow..end];
             let a = list.partition_point(|&i| self.segs[i as usize].bit < lo);
             let b = list.partition_point(|&i| self.segs[i as usize].bit < hi);
@@ -1136,7 +1335,33 @@ impl Block {
             self.fan_narrow[s] as usize,
             self.fan_start[s + 1] as usize,
         );
-        let (from, to) = if hi.saturating_sub(lo) <= 1 && narrow < end {
+        // The groups of flip-flops on the slot and the readers of more than one bit (part
+        // 4), the readers of the bits lo..hi (part 8)
+        if part & 4 != 0 {
+            let (group, group_end) = (
+                self.group_start[s] as usize,
+                self.group_start[s + 1] as usize,
+            );
+            for g in group..group_end {
+                let level = self.c1[s];
+                if level == self.groups[g].old {
+                    continue;
+                }
+                self.groups[g].old = level;
+                if level != self.groups[g].level {
+                    continue;
+                }
+                if self.in_comb {
+                    self.triggered_groups.push(g as u32);
+                } else {
+                    self.eval_group(g);
+                }
+            }
+        }
+        let start = if part & 4 != 0 { start } else { narrow };
+        let (from, to) = if part & 8 == 0 {
+            (end, end)
+        } else if hi.saturating_sub(lo) <= 1 && narrow < end {
             let list = &self.fan[narrow..end];
             (
                 narrow + list.partition_point(|e| e.1 < lo),
@@ -1208,6 +1433,12 @@ impl Block {
     /// and the ports inside for the VCD file (if vcd).
     pub fn settle(&mut self, out: &mut Vec<(u32, u8)>, vcd: Option<&mut Vec<u32>>) {
         let vcd_wanted = vcd.is_some();
+        #[cfg(feature = "prof")]
+        if let Some((_, calls)) = self.record.as_mut() {
+            calls.push(Call::Settle);
+        }
+        let _whole = crate::prof::Timer::new(106);
+        self.vcd_on = vcd_wanted;
         // Like the regions of Verilog: the combinational cells settle, the flip-flops whose
         // clock (or reset) a combinational cell changed then see the settled values, then
         // the new outputs of the flip-flops (like non-blocking assignments), again until
@@ -1219,7 +1450,7 @@ impl Block {
                 // Many dirty gates (or many in the last settle): a sweep of all is faster
                 let frontier: u32 = self.dirty[self.low..].iter().map(|w| w.count_ones()).sum();
                 let n = self.ncomb as u64;
-                if frontier as u64 * 32 >= n || self.last_evaluations * 12 >= n {
+                if frontier as u64 * 4 >= n || self.last_evaluations * 2 >= n {
                     // The gates a settle without a sweep would have evaluated, about
                     let t = crate::prof::now();
                     let changes = self.sweep_gates();
@@ -1239,7 +1470,11 @@ impl Block {
                 let bit = bits.trailing_zeros() as usize;
                 self.dirty[word] = bits & (bits - 1);
                 self.evaluations += 1;
-                self.eval_comb(word << 6 | bit);
+                if self.sweep {
+                    self.eval_sweep_gate(word << 6 | bit);
+                } else {
+                    self.eval_comb(word << 6 | bit);
+                }
             }
             self.low = self.dirty.len();
             if self.evaluations != before {
@@ -1300,6 +1535,7 @@ impl Block {
             // pending has the flip-flops that the new outputs clocked, for the next round
             drop(pending);
         }
+        let _output = crate::prof::Timer::new(107);
         let changed = std::mem::take(&mut self.changed);
         for &slot in &changed {
             let s = slot as usize;
@@ -1321,7 +1557,13 @@ impl Block {
         self.changed.clear();
     }
 
+    #[inline]
     fn mark_changed(&mut self, slot: u32) {
+        // Only the slots with ports outside, and with ports inside when there is a VCD file
+        let watch = self.watch[slot as usize];
+        if watch == 0 || (watch == 2 && !self.vcd_on) {
+            return;
+        }
         if !self.is_changed[slot as usize] {
             self.is_changed[slot as usize] = true;
             self.changed.push(slot);
@@ -2039,6 +2281,7 @@ struct EdgeFlop {
 
 /// The flip-flops on one clock slot that one level of it clocks: they are evaluated
 /// together, at the edge to the level
+#[derive(Clone)]
 struct EdgeGroup {
     level: u8,
     old: u8,
