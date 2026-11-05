@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "digsim-native"
-version = "0.1.0"
+version = "0.2.0"
 description = "Optional native simulation engine for DigSim"
 authors = [{name = "Fredrik Andersson", email = "freand@gmail.com"}]
 readme = "README.md"
