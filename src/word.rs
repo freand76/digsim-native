@@ -288,34 +288,34 @@ pub struct Cell {
     pub kind: Kind,
     pub inputs: Vec<Input>,
     pub outputs: Vec<Output>,
-    params: HashMap<String, BigInt>,
+    pub(crate) params: HashMap<String, BigInt>,
     // Registers: Q, the last clock level and the width
     pub q: Word,
     pub old_clock: u8,
-    width: usize,
+    pub(crate) width: usize,
     // Decoder: the values, the outputs for no match, and the outputs each value flips
-    values: Vec<W>,
-    none: W,
-    flips: HashMap<W, W>,
+    pub(crate) values: Vec<W>,
+    pub(crate) none: W,
+    pub(crate) flips: HashMap<W, W>,
     // Sum of products: for each term, the bits of A that must be 0 and those that must be 1
     terms: Vec<(W, W)>,
     // Tristate buffer: if it drives its output
     pub driving: bool,
     // The parameters an update uses, read once
-    a_signed: bool,
-    b_signed: bool,
+    pub(crate) a_signed: bool,
+    pub(crate) b_signed: bool,
     set_polarity: bool,
     clr_polarity: bool,
-    clk_polarity: u8,
-    en_polarity: u8,
-    arst_polarity: u8,
-    srst_polarity: u8,
+    pub(crate) clk_polarity: u8,
+    pub(crate) en_polarity: u8,
+    pub(crate) arst_polarity: u8,
+    pub(crate) srst_polarity: u8,
     aload_polarity: u8,
-    arst_value: Word,
-    srst_value: Word,
+    pub(crate) arst_value: Word,
+    pub(crate) srst_value: Word,
     y_mask: W,
     lut: BigInt,
-    offset: usize,
+    pub(crate) offset: usize,
 }
 
 impl Cell {

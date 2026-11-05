@@ -16,7 +16,10 @@ use pyo3::types::{PyInt, PyString};
 use std::collections::HashMap;
 
 mod bits;
+mod block;
+mod levels;
 mod lock;
+pub mod prof;
 mod queue;
 mod word;
 use num_bigint::{BigInt, BigUint};
@@ -36,6 +39,12 @@ const BUS: u8 = 5; // A bus of bits, up to 64 (PortMultiBitWire)
 const CELL_INPUT: u8 = 6; // A bit of an input of a functional cell (_CellInput)
 const WORD: u8 = 7; // The word output of a functional cell (_WordOut)
                     // 3 is the output of a native cell (PortOutDelta), never driven
+
+const BLOCK_PIN: u8 = 8; // An input of a cell in a block, driven from outside
+const BLOCK_INNER: u8 = 9; // Another port of a cell in a block, its value is in the block
+
+// The port of the settle events in the queue, not a port
+const SETTLE: u32 = u32::MAX - 1;
 
 /// The value of a bus: a number, or all bits the same code (X or Z)
 #[derive(Clone, Copy, PartialEq)]
@@ -76,7 +85,7 @@ struct Latest {
 const SLOTS: u32 = 4;
 
 #[derive(Clone, Copy, PartialEq)]
-enum Kind {
+pub(crate) enum Kind {
     Buf,
     Not,
     And,
@@ -166,7 +175,7 @@ const S: usize = 4;
 const L: usize = 5;
 const AD: usize = 6;
 
-struct Cell {
+pub(crate) struct Cell {
     kind: Kind,
     // The input ports, in the order of the kind; flip-flops and latches: C, D, E, R, S,
     // L, AD. The first of the input ports in Inner.cell_inputs.
@@ -297,9 +306,137 @@ struct Inner {
     free: Vec<u32>,
     // Statistics: events (native, Python), stale events, Python calls, cell evaluations
     stats: [u64; 5],
+    // The combinational cells by rank, see levels.rs: the gate cells, then the functional
+    // cells (ngates + their index)
+    ngates: usize,
+    rank: Vec<u32>,
+    // A cell to evaluate in the next settle, and the settle it was evaluated in last
+    dirty: Vec<bool>,
+    evaluated: Vec<u32>,
+    // The dirty cells by rank, and the lowest rank that can have one
+    buckets: Vec<Vec<u32>>,
+    cursor: usize,
+    // Cells that changed again in a settle that evaluated them, for the next one
+    deferred: Vec<u32>,
+    // The time of the next settle event, if there is one
+    settle_at: Option<i64>,
+    in_settle: bool,
+    settles: u32,
+    // Buses whose bits changed in a settle, updated once at its end
+    bus_dirty: Vec<bool>,
+    dirty_buses: Vec<u32>,
+    // The ports that changed in a settle, for the VCD file
+    collect_vcd: bool,
+    vcd_ports: Vec<u32>,
+    // The compiled blocks (block.rs), and the (slot, bit) of each port of one (aux)
+    blocks: Vec<block::Block>,
+    block_bits: Vec<(u32, u32)>,
+    // The blocks to settle in the next settle (queued), the settle they were settled in last
+    block_queue: Vec<u32>,
+    block_queued: Vec<bool>,
+    block_stamp: Vec<u32>,
+    block_deferred: Vec<u32>,
+    // Python ports that the engine sets itself: 1 a plain PortIn (then the update() of its
+    // parent, in fast_update), 2 a plain PortWire
+    fast_py: Vec<u8>,
+    fast_update: Vec<Option<Py<PyAny>>>,
 }
 
 impl Inner {
+    /// A combinational cell with a new input, evaluated in the next settle
+    fn mark_dirty(&mut self, id: usize) {
+        if self.dirty[id] {
+            return;
+        }
+        self.dirty[id] = true;
+        if self.in_settle && self.evaluated[id] == self.settles {
+            // Evaluated in this settle already (a loop through Python): in the next one
+            self.deferred.push(id as u32);
+            return;
+        }
+        let rank = self.rank[id] as usize;
+        self.buckets[rank].push(id as u32);
+        if rank < self.cursor {
+            self.cursor = rank;
+        }
+        if !self.in_settle {
+            self.schedule_settle();
+        }
+    }
+
+    /// A block that needs a settle: in this one if it didn't settle in it yet
+    fn request_block(&mut self, b: usize) {
+        if self.block_queued[b] {
+            return;
+        }
+        self.block_queued[b] = true;
+        if self.in_settle && self.block_stamp[b] == self.settles {
+            self.block_deferred.push(b as u32);
+            return;
+        }
+        self.block_queue.push(b as u32);
+        if !self.in_settle {
+            self.schedule_settle();
+        }
+    }
+
+    /// A settle event one ns from now, like the delay of a cell
+    fn schedule_settle(&mut self) {
+        if self.settle_at.is_some() {
+            return;
+        }
+        let time = self.time + 1;
+        self.settle_at = Some(time);
+        self.seq += 1;
+        let seq = self.seq;
+        self.heap.push(
+            time,
+            queue::Entry {
+                seq,
+                port: SETTLE,
+                slot: 0,
+            },
+        );
+    }
+
+    /// The dirty cells evaluated like without a settle, with events (for going back to
+    /// the Python engine)
+    fn flush_dirty(&mut self) {
+        let mut cells: Vec<u32> = Vec::new();
+        for bucket in self.buckets.iter_mut() {
+            cells.append(bucket);
+        }
+        cells.append(&mut self.deferred);
+        cells.sort_by_key(|&id| self.rank[id as usize]);
+        for id in cells {
+            let id = id as usize;
+            self.dirty[id] = false;
+            if id < self.ngates {
+                if let Some(out) = self.evaluate(id) {
+                    let output = self.cells[id].output;
+                    let delay = self.delay[output as usize];
+                    self.push(output, Value::Bit(out), delay);
+                }
+            } else {
+                let mut writes = Vec::new();
+                self.words[id - self.ngates].update(&mut writes);
+                for write in writes {
+                    match write {
+                        word::Write::Bit(port, code) => {
+                            let delay = self.delay[port as usize];
+                            self.push(port, Value::Bit(code), delay);
+                        }
+                        word::Write::Word(port, value) => {
+                            let delay = self.delay[port as usize];
+                            self.push(port, Value::Word(value), delay);
+                        }
+                    }
+                }
+            }
+        }
+        self.cursor = self.buckets.len();
+    }
+
     fn push(&mut self, port: u32, value: Value, delay: i64) {
         let time = self.time + delay;
         self.seq += 1;
@@ -374,92 +511,100 @@ impl Inner {
     fn evaluate(&mut self, c: usize) -> Option<u8> {
         let cell = &mut self.cells[c];
         let inputs = &self.cell_inputs[cell.first as usize..];
-        let v = |i: usize| self.value[inputs[i] as usize];
-        let enabled = |cell: &Cell| v(E) == cell.enable_level;
-        let reset = |cell: &Cell| v(R) == cell.reset_level;
-        let set = |cell: &Cell| v(S) == cell.set_level;
-        use Kind::*;
-        let out = match cell.kind {
-            Buf => v(0),
-            Not => not(v(0)),
-            And => and(v(0), v(1)),
-            Nand => not(and(v(0), v(1))),
-            Or => or(v(0), v(1)),
-            Nor => not(or(v(0), v(1))),
-            Xor => xor(v(0), v(1)),
-            Xnor => not(xor(v(0), v(1))),
-            AndNot => and(v(0), not(v(1))),
-            OrNot => or(v(0), not(v(1))),
-            Mux => mux(v(2), v(0), v(1)),
-            NMux => not(mux(v(2), v(0), v(1))),
-            Mux4 => mux4(v(4), v(5), v(0), v(1), v(2), v(3)),
-            Mux8 => {
-                let (s, t) = (v(8), v(9));
+        let values = &self.value;
+        eval_gate(cell, |i| values[inputs[i] as usize])
+    }
+}
+
+/// The new output of a gate cell from its input values (in the order of its kind), None if
+/// it doesn't set it (a flip-flop without an edge)
+pub(crate) fn eval_gate(cell: &mut Cell, v: impl Fn(usize) -> u8) -> Option<u8> {
+    let enabled = |cell: &Cell| v(E) == cell.enable_level;
+    let reset = |cell: &Cell| v(R) == cell.reset_level;
+    let set = |cell: &Cell| v(S) == cell.set_level;
+    use Kind::*;
+    let out = match cell.kind {
+        Buf => v(0),
+        Not => not(v(0)),
+        And => and(v(0), v(1)),
+        Nand => not(and(v(0), v(1))),
+        Or => or(v(0), v(1)),
+        Nor => not(or(v(0), v(1))),
+        Xor => xor(v(0), v(1)),
+        Xnor => not(xor(v(0), v(1))),
+        AndNot => and(v(0), not(v(1))),
+        OrNot => or(v(0), not(v(1))),
+        Mux => mux(v(2), v(0), v(1)),
+        NMux => not(mux(v(2), v(0), v(1))),
+        Mux4 => mux4(v(4), v(5), v(0), v(1), v(2), v(3)),
+        Mux8 => {
+            let (s, t) = (v(8), v(9));
+            mux(
+                v(10),
+                mux4(s, t, v(0), v(1), v(2), v(3)),
+                mux4(s, t, v(4), v(5), v(6), v(7)),
+            )
+        }
+        Mux16 => {
+            let (s, t, u) = (v(16), v(17), v(18));
+            mux(
+                v(19),
                 mux(
-                    v(10),
+                    u,
                     mux4(s, t, v(0), v(1), v(2), v(3)),
                     mux4(s, t, v(4), v(5), v(6), v(7)),
-                )
-            }
-            Mux16 => {
-                let (s, t, u) = (v(16), v(17), v(18));
+                ),
                 mux(
-                    v(19),
-                    mux(
-                        u,
-                        mux4(s, t, v(0), v(1), v(2), v(3)),
-                        mux4(s, t, v(4), v(5), v(6), v(7)),
-                    ),
-                    mux(
-                        u,
-                        mux4(s, t, v(8), v(9), v(10), v(11)),
-                        mux4(s, t, v(12), v(13), v(14), v(15)),
-                    ),
-                )
-            }
-            Aoi3 => not(or(and(v(0), v(1)), v(2))),
-            Oai3 => not(and(or(v(0), v(1)), v(2))),
-            Aoi4 => not(or(and(v(0), v(1)), and(v(2), v(3)))),
-            Oai4 => not(and(or(v(0), v(1)), or(v(2), v(3)))),
-            Tbuf => match v(1) {
-                1 => v(0),
-                0 => Z,
-                _ => X,
-            },
-            // GND and VDD, their outputs are set once by their default state
-            Const => return None,
-            Sr => {
-                return if reset(cell) {
-                    Some(0)
-                } else if set(cell) {
-                    Some(1)
-                } else {
-                    None
-                };
-            }
-            Dlatch => return enabled(cell).then(|| v(D)),
-            DlatchReset => {
-                return if reset(cell) {
-                    Some(cell.reset_value)
-                } else {
-                    enabled(cell).then(|| v(D))
-                };
-            }
-            DlatchSr => {
-                return if reset(cell) {
-                    Some(0)
-                } else if set(cell) {
-                    Some(1)
-                } else {
-                    enabled(cell).then(|| v(D))
-                };
-            }
-            Dff | Dffe | DffAsyncReset | DffeAsyncReset | Sdff | Sdffe | Sdffce | Aldff
-            | Aldffe | Dffsr | Dffsre => {
-                let clock = v(C);
-                let edge = clock != cell.old_clock && clock == cell.clock_edge;
-                let load = |cell: &Cell| v(L) == cell.load_level;
-                let out = match cell.kind {
+                    u,
+                    mux4(s, t, v(8), v(9), v(10), v(11)),
+                    mux4(s, t, v(12), v(13), v(14), v(15)),
+                ),
+            )
+        }
+        Aoi3 => not(or(and(v(0), v(1)), v(2))),
+        Oai3 => not(and(or(v(0), v(1)), v(2))),
+        Aoi4 => not(or(and(v(0), v(1)), and(v(2), v(3)))),
+        Oai4 => not(and(or(v(0), v(1)), or(v(2), v(3)))),
+        Tbuf => match v(1) {
+            1 => v(0),
+            0 => Z,
+            _ => X,
+        },
+        // GND and VDD, their outputs are set once by their default state
+        Const => return None,
+        Sr => {
+            return if reset(cell) {
+                Some(0)
+            } else if set(cell) {
+                Some(1)
+            } else {
+                None
+            };
+        }
+        Dlatch => return enabled(cell).then(|| v(D)),
+        DlatchReset => {
+            return if reset(cell) {
+                Some(cell.reset_value)
+            } else {
+                enabled(cell).then(|| v(D))
+            };
+        }
+        DlatchSr => {
+            return if reset(cell) {
+                Some(0)
+            } else if set(cell) {
+                Some(1)
+            } else {
+                enabled(cell).then(|| v(D))
+            };
+        }
+        Dff | Dffe | DffAsyncReset | DffeAsyncReset | Sdff | Sdffe | Sdffce | Aldff | Aldffe
+        | Dffsr | Dffsre => {
+            let clock = v(C);
+            let edge = clock != cell.old_clock && clock == cell.clock_edge;
+            let load = |cell: &Cell| v(L) == cell.load_level;
+            let out =
+                match cell.kind {
                     Dff => edge.then(|| v(1)),
                     Dffe => (edge && enabled(cell)).then(|| v(1)),
                     DffAsyncReset => {
@@ -528,12 +673,11 @@ impl Inner {
                         }
                     }
                 };
-                cell.old_clock = clock;
-                return out;
-            }
-        };
-        Some(out)
-    }
+            cell.old_clock = clock;
+            return out;
+        }
+    };
+    Some(out)
 }
 
 // A functional cell from Python: kind, inputs (width, update, bits, undefined bits),
@@ -555,6 +699,288 @@ type WordCellArgs = (
     u8,
     bool,
 );
+
+/// The cells that a port drives without a delay: through wires, buses and their bits,
+/// to the inputs of native cells (gate cells, then functional cells after ngates)
+#[allow(clippy::too_many_arguments)]
+fn driven_cells(
+    start: &[u32],
+    kinds: &[u8],
+    owners: &[u32],
+    wired_start: &[u32],
+    wired_targets: &[u32],
+    buses: &[Bus],
+    bit_index: &[u32],
+    ngates: usize,
+    seen: &mut [u32],
+    stamp: u32,
+    cells: &mut Vec<u32>,
+) {
+    let wired = |p: u32| {
+        let p = p as usize;
+        &wired_targets[wired_start[p] as usize..wired_start[p + 1] as usize]
+    };
+    let mut stack: Vec<u32> = Vec::new();
+    for &port in start {
+        stack.extend_from_slice(wired(port));
+    }
+    while let Some(port) = stack.pop() {
+        let p = port as usize;
+        if seen[p] == stamp {
+            continue;
+        }
+        seen[p] = stamp;
+        match kinds[p] {
+            IN | WIRE => {
+                cells.push(owners[p]);
+                stack.extend_from_slice(wired(port));
+            }
+            CELL_INPUT => {
+                cells.push(ngates as u32 + owners[p]);
+                stack.extend_from_slice(wired(port));
+            }
+            BIT => {
+                stack.extend_from_slice(wired(port));
+                let bus_port = owners[p];
+                let index = bit_index[p] as usize;
+                for &target in wired(bus_port) {
+                    match kinds[target as usize] {
+                        BUS => {
+                            let bus = &buses[owners[target as usize] as usize];
+                            if let Some(&bit) = bus.bits.get(index) {
+                                stack.push(bit);
+                            }
+                        }
+                        PY => {}
+                        _ => stack.push(target),
+                    }
+                }
+            }
+            BUS => {
+                stack.extend_from_slice(&buses[owners[p] as usize].bits);
+            }
+            PY | WORD => {}
+            _ => stack.extend_from_slice(wired(port)),
+        }
+    }
+}
+
+/// The rank of each combinational cell (gate cells, then functional cells), see levels.rs
+#[allow(clippy::too_many_arguments)]
+fn cell_ranks(
+    kinds: &[u8],
+    owners: &[u32],
+    wired_start: &[u32],
+    wired_targets: &[u32],
+    delays: &[i64],
+    cells: &[Cell],
+    buses: &[Bus],
+    words: &[word::Cell],
+) -> Vec<u32> {
+    use Kind::*;
+    let ngates = cells.len();
+    let count = ngates + words.len();
+    let mut bit_index = vec![0u32; kinds.len()];
+    for bus in buses {
+        for (index, &bit) in bus.bits.iter().enumerate() {
+            bit_index[bit as usize] = index as u32;
+        }
+    }
+    let mut seen = vec![0u32; kinds.len()];
+    let mut edges: Vec<Vec<u32>> = Vec::with_capacity(count);
+    let mut candidate = Vec::with_capacity(count);
+    let mut stamp = 0u32;
+    for cell in cells {
+        stamp += 1;
+        let mut targets = Vec::new();
+        driven_cells(
+            &[cell.output],
+            kinds,
+            owners,
+            wired_start,
+            wired_targets,
+            buses,
+            &bit_index,
+            ngates,
+            &mut seen,
+            stamp,
+            &mut targets,
+        );
+        let combinational = matches!(
+            cell.kind,
+            Buf | Not
+                | And
+                | Nand
+                | Or
+                | Nor
+                | Xor
+                | Xnor
+                | AndNot
+                | OrNot
+                | Mux
+                | NMux
+                | Mux4
+                | Mux8
+                | Mux16
+                | Aoi3
+                | Oai3
+                | Aoi4
+                | Oai4
+                | Tbuf
+        );
+        candidate.push(combinational && delays[cell.output as usize] == 1);
+        targets.sort_unstable();
+        targets.dedup();
+        edges.push(targets);
+    }
+    for cell in words {
+        stamp += 1;
+        let mut targets = Vec::new();
+        let mut ports = Vec::new();
+        let mut delay_one = true;
+        for output in &cell.outputs {
+            ports.extend_from_slice(&output.bit_ports);
+            if let Some(port) = output.word_port {
+                delay_one &= delays[port as usize] == 1;
+            }
+            for (target, _) in &output.links {
+                targets.push((ngates + target) as u32);
+            }
+        }
+        delay_one &= ports.iter().all(|&p| delays[p as usize] == 1);
+        driven_cells(
+            &ports,
+            kinds,
+            owners,
+            wired_start,
+            wired_targets,
+            buses,
+            &bit_index,
+            ngates,
+            &mut seen,
+            stamp,
+            &mut targets,
+        );
+        candidate.push(!cell.is_register() && delay_one);
+        targets.sort_unstable();
+        targets.dedup();
+        edges.push(targets);
+    }
+    levels::ranks(&edges, &candidate)
+}
+
+/// A functional cell from its arguments from Python
+fn make_word_cell(args: WordCellArgs) -> PyResult<word::Cell> {
+    let (kind, inputs, outputs, params, q, old_clock, driving) = args;
+    let kind = *word::KINDS
+        .get(kind as usize)
+        .ok_or_else(|| PyValueError::new_err(format!("Unknown functional cell kind {kind}")))?;
+    let inputs = inputs
+        .into_iter()
+        .map(|(width, update, v, u)| word::Input {
+            word: word::Word {
+                v: v.into(),
+                u: u.into(),
+            },
+            width,
+            update,
+        })
+        .collect();
+    let outputs = outputs
+        .into_iter()
+        .map(
+            |(width, bit_ports, bit_outputs, word_port, links, last)| word::Output {
+                mask: word::mask(width),
+                width,
+                last: last.map(|(v, u)| word::Word {
+                    v: v.into(),
+                    u: u.into(),
+                }),
+                bit_ports,
+                bit_outputs: bit_outputs.into(),
+                word_port,
+                links,
+            },
+        )
+        .collect();
+    Ok(word::Cell::new(
+        kind,
+        inputs,
+        outputs,
+        params,
+        word::Word {
+            v: q.0.into(),
+            u: q.1.into(),
+        },
+        old_clock,
+        driving,
+    ))
+}
+
+// A cell of a block from Python: op (0 functional, 1 gate, 2 constant), the gate kind,
+// inputs (their bits as (slot, bit), if they update the cell), output slots, rank (NONE
+// for a stateful cell), the functional cell, the levels and clock of a gate, the value
+// of a constant
+type BlockCellArgs = (
+    u8,
+    u8,
+    Vec<(Vec<(u32, u32)>, bool)>,
+    Vec<u32>,
+    u32,
+    Option<WordCellArgs>,
+    [u8; 6],
+    u8,
+    u8,
+);
+
+// A block: the widths of its slots, its cells, the ports outside that its slots drive
+// (slot, bit, port), and the output ports inside for the VCD file (slot, bit, port)
+type BlockArgs = (
+    Vec<u32>,
+    Vec<BlockCellArgs>,
+    Vec<(u32, u32, u32)>,
+    Vec<(u32, u32, u32)>,
+);
+
+fn make_block(args: BlockArgs) -> PyResult<block::Block> {
+    let (widths, cells, pins, vcd) = args;
+    let mut block_cells = Vec::with_capacity(cells.len());
+    for (op, kind, inputs, outputs, rank, word_args, levels, old_clock, value) in cells {
+        let word = match word_args {
+            Some(args) => Some(make_word_cell(args)?),
+            None => None,
+        };
+        let gate = if op == 1 {
+            Some(Cell {
+                kind: *KINDS
+                    .get(kind as usize)
+                    .ok_or_else(|| PyValueError::new_err(format!("Unknown cell kind {kind}")))?,
+                first: 0,
+                output: 0,
+                clock_edge: levels[0],
+                reset_level: levels[1],
+                reset_value: levels[2],
+                enable_level: levels[3],
+                set_level: levels[4],
+                load_level: levels[5],
+                old_clock,
+            })
+        } else {
+            None
+        };
+        block_cells.push(block::CellArgs {
+            op,
+            inputs,
+            outputs,
+            rank,
+            word,
+            gate,
+            old_clock,
+            value,
+        });
+    }
+    Ok(block::Block::new(widths, block_cells, pins, vcd))
+}
 
 /// The simulation of a circuit, see digsim/circuit/_native.py
 #[pyclass(frozen)]
@@ -644,10 +1070,31 @@ impl<'a, 'py> Ctx<'a, 'py> {
     fn call_set_value(&mut self, port: u32, value: Bound<'py, PyAny>) -> PyResult<()> {
         self.st().stats[3] += 1;
         let engine = self.engine;
+        let p = port as usize;
+        let fast = self.st().fast_py.get(p).copied().unwrap_or(0);
+        if fast != 0 {
+            // PortIn/PortWire.set_value() without wires: the value, and the update()
+            let update = if fast == 1 {
+                let py = self.py;
+                self.st().fast_update[p].as_ref().map(|u| u.clone_ref(py))
+            } else {
+                None
+            };
+            self.guard = None;
+            let object = engine.port(self.py, p);
+            let mut result = object.setattr(intern!(self.py, "_value"), value);
+            if let (Ok(()), Some(update)) = (&result, update) {
+                result = update.bind(self.py).call0().map(|_| ());
+            }
+            self.guard = Some(engine.inner.lock());
+            return result;
+        }
         self.guard = None;
+        let t0 = prof::now();
         let result = engine
             .port(self.py, port as usize)
             .call_method1(intern!(self.py, "set_value"), (value,));
+        prof::add(91, t0);
         self.guard = Some(engine.inner.lock());
         result.map(|_| ())
     }
@@ -725,8 +1172,18 @@ impl<'a, 'py> Ctx<'a, 'py> {
                 if value != self.st().value[p] {
                     self.update_wires(port, value)?;
                 }
-                let bus = self.st().owner[p];
-                self.update_value_from_bits(bus)?;
+                let st = self.st();
+                let bus = st.owner[p];
+                if st.in_settle {
+                    // Once at the end of the settle, not for every bit
+                    let index = st.owner[bus as usize] as usize;
+                    if !st.bus_dirty[index] {
+                        st.bus_dirty[index] = true;
+                        st.dirty_buses.push(bus);
+                    }
+                } else {
+                    self.update_value_from_bits(bus)?;
+                }
             }
             BUS => {
                 let value = match value {
@@ -735,6 +1192,18 @@ impl<'a, 'py> Ctx<'a, 'py> {
                 };
                 self.set_bus(port, value)?;
             }
+            BLOCK_PIN => {
+                let st = self.st();
+                if value != st.value[p] {
+                    st.value[p] = value;
+                    let b = st.owner[p] as usize;
+                    let (slot, bit) = st.block_bits[st.aux[p] as usize];
+                    if st.blocks[b].set_input(slot, bit, value) {
+                        st.request_block(b);
+                    }
+                }
+            }
+            BLOCK_INNER => {}
             CELL_INPUT => {
                 // _CellInput.set_value()
                 if value == self.st().value[p] {
@@ -832,6 +1301,10 @@ impl<'a, 'py> Ctx<'a, 'py> {
 
     fn evaluate(&mut self, cell: usize) {
         let st = self.st();
+        if st.rank[cell] != levels::NONE {
+            st.mark_dirty(cell);
+            return;
+        }
         st.stats[4] += 1;
         if let Some(out) = st.evaluate(cell) {
             let output = st.cells[cell].output;
@@ -859,6 +1332,11 @@ impl<'a, 'py> Ctx<'a, 'py> {
 
     fn evaluate_word(&mut self, cell: usize) {
         let st = self.st();
+        let id = st.ngates + cell;
+        if st.rank[id] != levels::NONE {
+            st.mark_dirty(id);
+            return;
+        }
         st.stats[4] += 1;
         let mut writes = Vec::new();
         st.words[cell].update(&mut writes);
@@ -867,6 +1345,7 @@ impl<'a, 'py> Ctx<'a, 'py> {
 
     // _WordOut.delta_cycle(): set the bits of the cells it drives, then update them
     fn word_event(&mut self, port: u32, value: &bits::Bits) {
+        let _t = prof::Timer::new(94);
         let st = self.st();
         let p = port as usize;
         let cell = st.owner[p] as usize;
@@ -895,6 +1374,138 @@ impl<'a, 'py> Ctx<'a, 'py> {
         }
     }
 
+    /// Evaluate the dirty cells, each once in the order of their ranks, their outputs
+    /// change now. The buses they drive change once, at the end.
+    fn settle(&mut self, vcd: &Option<Bound<'py, PyAny>>) -> PyResult<()> {
+        let st = self.st();
+        st.settle_at = None;
+        st.in_settle = true;
+        st.settles = st.settles.wrapping_add(1);
+        st.collect_vcd = vcd.is_some();
+        let t0 = prof::now();
+        let result = self.settle_cells();
+        prof::add(90, t0);
+        let st = self.st();
+        st.in_settle = false;
+        // The blocks and cells that changed again, in the next settle
+        let blocks = std::mem::take(&mut st.block_deferred);
+        st.block_queue.extend_from_slice(&blocks);
+        let deferred = std::mem::take(&mut st.deferred);
+        for id in deferred {
+            let rank = st.rank[id as usize] as usize;
+            st.buckets[rank].push(id);
+            st.cursor = st.cursor.min(rank);
+        }
+        if st.cursor < st.buckets.len() || !st.block_queue.is_empty() {
+            st.schedule_settle();
+        }
+        result?;
+        if let Some(vcd) = vcd {
+            let ports = std::mem::take(&mut self.st().vcd_ports);
+            let time = self.st().time;
+            let engine = self.engine;
+            self.guard = None;
+            let mut result = Ok(());
+            for port in ports {
+                if let Err(error) = vcd.call_method1(
+                    intern!(self.py, "write"),
+                    (engine.port(self.py, port as usize), time),
+                ) {
+                    result = Err(error);
+                    break;
+                }
+            }
+            self.guard = Some(engine.inner.lock());
+            result?;
+        }
+        Ok(())
+    }
+
+    fn settle_cells(&mut self) -> PyResult<()> {
+        let mut changes: Vec<(u32, u8)> = Vec::new();
+        loop {
+            let st = self.st();
+            if let Some(b) = st.block_queue.pop() {
+                let b = b as usize;
+                st.block_queued[b] = false;
+                st.block_stamp[b] = st.settles;
+                changes.clear();
+                let mut vcd_ports = std::mem::take(&mut st.vcd_ports);
+                let collect = st.collect_vcd;
+                let before = st.blocks[b].evaluations;
+                let t0 = prof::now();
+                st.blocks[b].settle(&mut changes, collect.then_some(&mut vcd_ports));
+                prof::add(95, t0);
+                st.stats[4] += st.blocks[b].evaluations - before;
+                st.vcd_ports = vcd_ports;
+                if st.blocks[b].needs_settle() {
+                    st.request_block(b);
+                }
+                let t1 = prof::now();
+                for &(port, code) in &changes {
+                    self.update_wires(port, code)?;
+                }
+                prof::add(96, t1);
+                continue;
+            }
+            let st = self.st();
+            while st.cursor < st.buckets.len() && st.buckets[st.cursor].is_empty() {
+                st.cursor += 1;
+            }
+            if st.cursor == st.buckets.len() {
+                if st.dirty_buses.is_empty() {
+                    return Ok(());
+                }
+                let buses = std::mem::take(&mut st.dirty_buses);
+                for &bus in &buses {
+                    let st = self.st();
+                    let index = st.owner[bus as usize] as usize;
+                    st.bus_dirty[index] = false;
+                }
+                let t2 = prof::now();
+                for bus in buses {
+                    self.update_value_from_bits(bus)?;
+                }
+                prof::add(97, t2);
+                continue;
+            }
+            let cursor = st.cursor;
+            let id = st.buckets[cursor].pop().unwrap() as usize;
+            st.dirty[id] = false;
+            st.evaluated[id] = st.settles;
+            st.stats[4] += 1;
+            if id < st.ngates {
+                if let Some(out) = st.evaluate(id) {
+                    let output = st.cells[id].output;
+                    if st.collect_vcd && st.value[output as usize] != out {
+                        st.vcd_ports.push(output);
+                    }
+                    self.update_wires(output, out)?;
+                }
+            } else {
+                let mut writes = Vec::new();
+                let t0 = prof::now();
+                st.words[id - st.ngates].update(&mut writes);
+                prof::add(st.words[id - st.ngates].kind as usize, t0);
+                let t1 = prof::now();
+                let n = writes.len();
+                for write in writes {
+                    match write {
+                        word::Write::Bit(port, code) => {
+                            let st = self.st();
+                            if st.collect_vcd {
+                                st.vcd_ports.push(port);
+                            }
+                            self.update_wires(port, code)?;
+                        }
+                        word::Write::Word(port, value) => self.word_event(port, &value),
+                    }
+                }
+                prof::add(100 + n.min(20), t1);
+            }
+        }
+    }
+
     /// Process the next event, see Circuit.process_single_event(). Returns None if there
     /// is none before the stop time, otherwise the port.
     fn process(
@@ -908,6 +1519,15 @@ impl<'a, 'py> Ctx<'a, 'py> {
             let Some((time, event)) = st.heap.pop() else {
                 return Ok(None);
             };
+            if event.port == SETTLE {
+                if stop_time.is_some_and(|stop| time > stop) {
+                    st.heap.push(time, event);
+                    return Ok(None);
+                }
+                st.time = time;
+                self.settle(vcd)?;
+                return Ok(Some(SETTLE));
+            }
             let p = event.port as usize;
             let latest = st.latest[p];
             let valid = latest.seq != 0
@@ -981,7 +1601,14 @@ impl Engine {
         aux: Vec<u32>,
         words: Vec<WordCellArgs>,
         time: i64,
+        blocks: Vec<BlockArgs>,
+        block_bits: Vec<(u32, u32)>,
     ) -> PyResult<Self> {
+        let mut compiled = Vec::with_capacity(blocks.len());
+        for args in blocks {
+            compiled.push(make_block(args)?);
+        }
+        let block_count = compiled.len();
         let mut wired_start = Vec::with_capacity(wired.len() + 1);
         let mut wired_targets = Vec::new();
         for targets in &wired {
@@ -997,50 +1624,8 @@ impl Engine {
         }
         driver_start.push(all_drivers.len() as u32);
         let mut word_cells = Vec::with_capacity(words.len());
-        for (kind, inputs, outputs, params, q, old_clock, driving) in words {
-            let kind = *word::KINDS.get(kind as usize).ok_or_else(|| {
-                PyValueError::new_err(format!("Unknown functional cell kind {kind}"))
-            })?;
-            let inputs = inputs
-                .into_iter()
-                .map(|(width, update, v, u)| word::Input {
-                    word: word::Word {
-                        v: v.into(),
-                        u: u.into(),
-                    },
-                    width,
-                    update,
-                })
-                .collect();
-            let outputs = outputs
-                .into_iter()
-                .map(
-                    |(width, bit_ports, bit_outputs, word_port, links, last)| word::Output {
-                        mask: word::mask(width),
-                        width,
-                        last: last.map(|(v, u)| word::Word {
-                            v: v.into(),
-                            u: u.into(),
-                        }),
-                        bit_ports,
-                        bit_outputs: bit_outputs.into(),
-                        word_port,
-                        links,
-                    },
-                )
-                .collect();
-            word_cells.push(word::Cell::new(
-                kind,
-                inputs,
-                outputs,
-                params,
-                word::Word {
-                    v: q.0.into(),
-                    u: q.1.into(),
-                },
-                old_clock,
-                driving,
-            ));
+        for args in words {
+            word_cells.push(make_word_cell(args)?);
         }
         let count = ports.len();
         let mut native_cells = Vec::with_capacity(cells.len());
@@ -1069,6 +1654,24 @@ impl Engine {
                 value: bus_value(&value)?,
             });
         }
+        let ngates = native_cells.len();
+        let rank = cell_ranks(
+            &kinds,
+            &owners,
+            &wired_start,
+            &wired_targets,
+            &delays,
+            &native_cells,
+            &native_buses,
+            &word_cells,
+        );
+        let depth = rank
+            .iter()
+            .filter(|&&r| r != levels::NONE)
+            .max()
+            .map_or(0, |&r| r as usize + 1);
+        let cell_count = rank.len();
+        let bus_count = native_buses.len();
         let objects = [
             0i64.into_pyobject(py)?.into_any().unbind(),
             1i64.into_pyobject(py)?.into_any().unbind(),
@@ -1098,6 +1701,28 @@ impl Engine {
                 payloads: Vec::new(),
                 free: Vec::new(),
                 stats: [0; 5],
+                ngates,
+                rank,
+                dirty: vec![false; cell_count],
+                evaluated: vec![0; cell_count],
+                buckets: vec![Vec::new(); depth],
+                cursor: depth,
+                deferred: Vec::new(),
+                settle_at: None,
+                in_settle: false,
+                settles: 0,
+                bus_dirty: vec![false; bus_count],
+                dirty_buses: Vec::new(),
+                collect_vcd: false,
+                vcd_ports: Vec::new(),
+                blocks: compiled,
+                block_bits,
+                block_queue: Vec::new(),
+                block_queued: vec![false; block_count],
+                block_stamp: vec![0; block_count],
+                block_deferred: Vec::new(),
+                fast_py: Vec::new(),
+                fast_update: Vec::new(),
             }),
             ports: lock::Lock::new(ports),
             values: objects,
@@ -1120,9 +1745,46 @@ impl Engine {
         let p = nid as usize;
         if st.kind[p] == BUS {
             self.bus_object(py, st.buses[st.owner[p] as usize].value)
+        } else if st.kind[p] == BLOCK_INNER {
+            let (slot, bit) = st.block_bits[st.aux[p] as usize];
+            let code = st.blocks[st.owner[p] as usize].code(slot, bit);
+            Ok(self.values[code as usize].bind(py).clone())
         } else {
             Ok(self.values[st.value[p] as usize].bind(py).clone())
         }
+    }
+
+    /// The Python ports the engine sets itself: (nid, 1 for a PortIn or 2 a PortWire, the
+    /// update() of the parent of a PortIn)
+    fn set_fast_ports(&self, py: Python<'_>, ports: Vec<(u32, u8, Option<Py<PyAny>>)>) {
+        let mut st = self.inner.lock();
+        let count = st.kind.len();
+        st.fast_py = vec![0; count];
+        st.fast_update = (0..count).map(|_| None).collect();
+        for (nid, kind, update) in ports {
+            let p = nid as usize;
+            if p < count && st.kind[p] == PY {
+                st.fast_py[p] = kind;
+                st.fast_update[p] = update.map(|u| u.clone_ref(py));
+            }
+        }
+    }
+
+    /// The value of a native port object (its _nid), for the value property of the port
+    fn get<'py>(&self, py: Python<'py>, port: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let nid: u32 = port.getattr(intern!(py, "_nid"))?.extract()?;
+        self.value(py, nid)
+    }
+
+    /// Port.set_value() of a native port object (its _nid), for the value property
+    fn put(
+        &self,
+        py: Python<'_>,
+        port: &Bound<'_, PyAny>,
+        value: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let nid: u32 = port.getattr(intern!(py, "_nid"))?.extract()?;
+        self.set_input(py, nid, value)
     }
 
     /// Set the value of a native port, without updating anything (Port._value = value)
@@ -1153,12 +1815,21 @@ impl Engine {
 
     /// Port.set_value() of a native port that Python code calls
     fn set_input(&self, py: Python<'_>, nid: u32, value: Bound<'_, PyAny>) -> PyResult<()> {
+        let t0 = prof::now();
         let mut ctx = Ctx::new(py, self);
-        if ctx.st().kind[nid as usize] == BUS {
+        let r = if ctx.st().kind[nid as usize] == BUS {
             ctx.set_bus(nid, bus_value(&value)?)
         } else {
             ctx.set_value(nid, bit_code(&value)?)
-        }
+        };
+        drop(ctx);
+        prof::add(93, t0);
+        r
+    }
+
+    #[staticmethod]
+    fn profile() -> Vec<(usize, u64, u64)> {
+        prof::dump()
     }
 
     /// Circuit.run() up to the stop time. Returns if it stopped for a single step.
@@ -1170,18 +1841,28 @@ impl Engine {
         single_step: bool,
         vcd: Option<Bound<'_, PyAny>>,
     ) -> PyResult<bool> {
+        let t0 = prof::now();
         let mut ctx = Ctx::new(py, self);
+        let original_stop = stop_time;
         let mut stop_time = stop_time;
         let mut single_step_stop = false;
         while ctx.st().time <= stop_time {
             let Some(port) = ctx.process(Some(stop_time), &vcd)? else {
                 break;
             };
-            if single_step && ctx.st().toplevel[port as usize] {
+            if single_step && port != SETTLE && ctx.st().toplevel[port as usize] {
                 stop_time = ctx.st().time;
                 single_step_stop = true;
             }
         }
+        // The time of the stop, also when the last event was before it
+        let first_stop = original_stop;
+        let st = ctx.st();
+        if st.time < first_stop {
+            st.time = first_stop;
+        }
+        drop(ctx);
+        prof::add(92, t0);
         Ok(single_step_stop)
     }
 
@@ -1196,7 +1877,7 @@ impl Engine {
         let mut ctx = Ctx::new(py, self);
         Ok(match ctx.process(stop_time, &vcd)? {
             None => (false, false),
-            Some(port) => (true, ctx.st().toplevel[port as usize]),
+            Some(port) => (true, port != SETTLE && ctx.st().toplevel[port as usize]),
         })
     }
 
@@ -1234,9 +1915,14 @@ impl Engine {
         Vec<Option<u64>>,
         Vec<Bound<'py, PyAny>>,
     )> {
-        let st = self.inner.lock();
+        let mut st = self.inner.lock();
+        // The cells waiting for a settle make their events, like without one
+        st.flush_dirty();
         let mut events = Vec::with_capacity(st.heap.len());
         for (time, e) in st.heap.iter() {
+            if e.port == SETTLE {
+                continue;
+            }
             let value = st.slot_value(py, e.slot);
             events.push((time, e.seq, e.port, self.object(py, &value)?));
         }
@@ -1295,6 +1981,47 @@ impl Engine {
                 )
             })
             .collect()
+    }
+
+    /// The default state of a block: its registers 0, and its constants
+    fn block_default_state(&self, block: usize) {
+        let mut st = self.inner.lock();
+        st.blocks[block].default_state();
+        if st.blocks[block].needs_settle() {
+            st.request_block(block);
+        }
+    }
+
+    /// The state of the cells of a block for going back to Python: Q (bits, undefined),
+    /// the clock level, and if the cell waits for a settle
+    #[allow(clippy::type_complexity)]
+    fn export_block<'py>(
+        &self,
+        py: Python<'py>,
+        block: usize,
+    ) -> Vec<(Option<(BigUint, BigUint)>, Bound<'py, PyAny>, bool)> {
+        let st = self.inner.lock();
+        st.blocks[block]
+            .export_cells()
+            .into_iter()
+            .map(|(q, clock, waiting)| {
+                (
+                    q.map(|(v, x)| {
+                        (
+                            BigUint::from(&bits::Bits::from_words(&v)),
+                            BigUint::from(&bits::Bits::from_words(&x)),
+                        )
+                    }),
+                    self.values[clock as usize].bind(py).clone(),
+                    waiting,
+                )
+            })
+            .collect()
+    }
+
+    /// The time of the next settle, None if there is none
+    fn settle_time(&self) -> Option<i64> {
+        self.inner.lock().settle_at
     }
 
     fn __len__(&self) -> usize {

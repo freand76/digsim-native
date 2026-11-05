@@ -71,6 +71,29 @@ impl Bits {
         }
     }
 
+    /// The number from 64-bit words, the lowest first
+    pub fn from_words(words: &[u64]) -> Bits {
+        let high = words.iter().rposition(|&w| w != 0);
+        match high {
+            None => Bits::Small(0),
+            Some(0) => Bits::Small(words[0]),
+            Some(h) => Bits::from(BigUint::from_slice(
+                &words[..=h]
+                    .iter()
+                    .flat_map(|&w| [w as u32, (w >> 32) as u32])
+                    .collect::<Vec<u32>>(),
+            )),
+        }
+    }
+
+    /// The 64-bit words of the number, the lowest first
+    pub fn to_words(&self) -> Vec<u64> {
+        match self {
+            Bits::Small(v) => vec![*v],
+            Bits::Big(v) => v.to_u64_digits(),
+        }
+    }
+
     pub fn to_usize(&self) -> Option<usize> {
         self.to_u64().and_then(|v| usize::try_from(v).ok())
     }
