@@ -340,6 +340,8 @@ struct Inner {
     // parent, in fast_update), 2 a plain PortWire
     fast_py: Vec<u8>,
     fast_update: Vec<Option<Py<PyAny>>>,
+    // Setting a bus: its bits update the buses they are in at the end
+    bus_batch: u32,
 }
 
 impl Inner {
@@ -1072,7 +1074,7 @@ impl<'a, 'py> Ctx<'a, 'py> {
         let engine = self.engine;
         let p = port as usize;
         let fast = self.st().fast_py.get(p).copied().unwrap_or(0);
-        if fast != 0 {
+        if fast == 1 || fast == 2 {
             // PortIn/PortWire.set_value() without wires: the value, and the update()
             let update = if fast == 1 {
                 let py = self.py;
@@ -1097,6 +1099,41 @@ impl<'a, 'py> Ctx<'a, 'py> {
         prof::add(91, t0);
         self.guard = Some(engine.inner.lock());
         result.map(|_| ())
+    }
+
+    /// PortOutDelta.delta_cycle() of a plain Python output: Port.update_wires(), the
+    /// ports it drives set here
+    fn output_event(&mut self, port: u32, value: Bound<'py, PyAny>) -> PyResult<()> {
+        let py = self.py;
+        let engine = self.engine;
+        self.guard = None;
+        let object = engine.port(py, port as usize);
+        let same = object
+            .getattr(intern!(py, "_value"))
+            .and_then(|old| old.eq(&value));
+        let result = match same {
+            Ok(true) => Ok(false),
+            Ok(false) => object.setattr(intern!(py, "_value"), &value).map(|_| true),
+            Err(error) => Err(error),
+        };
+        self.guard = Some(engine.inner.lock());
+        if !result? {
+            return Ok(());
+        }
+        let p = port as usize;
+        let (start, end) = {
+            let st = self.st();
+            (st.wired_start[p] as usize, st.wired_start[p + 1] as usize)
+        };
+        for i in start..end {
+            let target = self.st().wired_targets[i];
+            match self.st().kind[target as usize] {
+                PY => self.call_set_value(target, value.clone())?,
+                BUS => self.set_bus(target, bus_value(&value)?)?,
+                _ => self.set_value(target, bit_code(&value)?)?,
+            }
+        }
+        Ok(())
     }
 
     // Port.update_wires() of a one-bit port
@@ -1174,8 +1211,8 @@ impl<'a, 'py> Ctx<'a, 'py> {
                 }
                 let st = self.st();
                 let bus = st.owner[p];
-                if st.in_settle {
-                    // Once at the end of the settle, not for every bit
+                if st.in_settle || st.bus_batch > 0 {
+                    // Once at the end of the settle (or of setting a bus), not for every bit
                     let index = st.owner[bus as usize] as usize;
                     if !st.bus_dirty[index] {
                         st.bus_dirty[index] = true;
@@ -1229,15 +1266,35 @@ impl<'a, 'py> Ctx<'a, 'py> {
     fn set_bus(&mut self, port: u32, value: BusValue) -> PyResult<()> {
         let bus = self.st().owner[port as usize] as usize;
         let count = self.st().buses[bus].bits.len();
+        // The buses that the bits change get their new values once, after all bits
+        self.st().bus_batch += 1;
+        let mut result = Ok(());
         for i in 0..count {
             let bit = self.st().buses[bus].bits[i];
             let bit_value = match value {
                 BusValue::Int(v) => ((v >> i) & 1) as u8,
                 BusValue::Code(c) => c,
             };
-            self.set_value(bit, bit_value)?;
+            result = self.set_value(bit, bit_value);
+            if result.is_err() {
+                break;
+            }
         }
-        Ok(())
+        let st = self.st();
+        st.bus_batch -= 1;
+        if st.bus_batch == 0 && !st.in_settle {
+            let buses = std::mem::take(&mut st.dirty_buses);
+            for &dirty in &buses {
+                let index = st.owner[dirty as usize] as usize;
+                st.bus_dirty[index] = false;
+            }
+            for dirty in buses {
+                if result.is_ok() {
+                    result = self.update_value_from_bits(dirty);
+                }
+            }
+        }
+        result
     }
 
     // Port.update_wires() of a bus port
@@ -1560,13 +1617,17 @@ impl<'a, 'py> Ctx<'a, 'py> {
                 }
                 Value::Python(value) => {
                     st.stats[1] += 1;
-                    let engine = self.engine;
-                    self.guard = None;
-                    let result = engine
-                        .port(py, p)
-                        .call_method1(intern!(py, "delta_cycle"), (value.bind(py),));
-                    self.guard = Some(engine.inner.lock());
-                    result?;
+                    if st.fast_py.get(p).copied() == Some(3) {
+                        self.output_event(event.port, value.bind(py).clone())?;
+                    } else {
+                        let engine = self.engine;
+                        self.guard = None;
+                        let result = engine
+                            .port(py, p)
+                            .call_method1(intern!(py, "delta_cycle"), (value.bind(py),));
+                        self.guard = Some(engine.inner.lock());
+                        result?;
+                    }
                 }
             }
             if let Some(vcd) = vcd {
@@ -1723,6 +1784,7 @@ impl Engine {
                 block_deferred: Vec::new(),
                 fast_py: Vec::new(),
                 fast_update: Vec::new(),
+                bus_batch: 0,
             }),
             ports: lock::Lock::new(ports),
             values: objects,
@@ -1754,8 +1816,9 @@ impl Engine {
         }
     }
 
-    /// The Python ports the engine sets itself: (nid, 1 for a PortIn or 2 a PortWire, the
-    /// update() of the parent of a PortIn)
+    /// The Python ports the engine sets itself: (nid, 1 for a PortIn, 2 a PortWire or 3
+    /// a PortOutDelta whose events set the ports it drives, the update() of the parent of
+    /// a PortIn)
     fn set_fast_ports(&self, py: Python<'_>, ports: Vec<(u32, u8, Option<Py<PyAny>>)>) {
         let mut st = self.inner.lock();
         let count = st.kind.len();
