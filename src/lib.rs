@@ -42,6 +42,7 @@ const WORD: u8 = 7; // The word output of a functional cell (_WordOut)
 
 const BLOCK_PIN: u8 = 8; // An input of a cell in a block, driven from outside
 const BLOCK_INNER: u8 = 9; // Another port of a cell in a block, its value is in the block
+const CLOCK: u8 = 10; // The timer of a Clock (its feedback port): its events toggle the clock
 
 // The port of the settle events in the queue, not a port
 const SETTLE: u32 = u32::MAX - 1;
@@ -341,6 +342,8 @@ struct Inner {
     // parent, in fast_update), 2 a plain PortWire
     fast_py: Vec<u8>,
     fast_update: Vec<Option<Py<PyAny>>>,
+    // The output port of each Clock the engine runs (the owner of its timer port)
+    clock_outs: Vec<u32>,
     // Setting a bus: its bits update the buses they are in at the end (with levels, without
     // them every bit updates its bus, like in Python)
     bus_batch: u32,
@@ -1760,6 +1763,19 @@ impl<'a, 'py> Ctx<'a, 'py> {
             let value = st.slot_value(py, event.slot);
             st.release(event.slot);
             match value {
+                Value::Bit(value) if st.kind[p] == CLOCK => {
+                    // Clock.update(): the output gets the level of the timer, the timer
+                    // the other level half a period later
+                    st.stats[0] += 1;
+                    st.value[p] = value;
+                    let out = st.clock_outs[st.owner[p] as usize];
+                    let delay = st.delay[p];
+                    let next = if value == 1 { 0 } else { 1 };
+                    st.push(event.port, Value::Bit(next), delay);
+                    // PortOutImmediate: the wires now, an event for the VCD file
+                    self.update_wires(out, value)?;
+                    self.st().push(out, Value::Bit(value), 0);
+                }
                 Value::Bit(value) => {
                     st.stats[0] += 1;
                     self.update_wires(event.port, value)?
@@ -1945,6 +1961,7 @@ impl Engine {
                 block_deferred: Vec::new(),
                 fast_py: Vec::new(),
                 fast_update: Vec::new(),
+                clock_outs: Vec::new(),
                 bus_batch: 0,
                 batch_buses: levels,
                 bus_block: Vec::new(),
@@ -2263,6 +2280,24 @@ impl Engine {
         {
             (0, 0, 0)
         }
+    }
+
+    /// The Clocks the engine runs: the output port of each, the timer ports have the kind
+    /// CLOCK and the number of their clock as owner
+    fn set_clocks(&self, outs: Vec<u32>) {
+        self.inner.lock().clock_outs = outs;
+    }
+
+    /// The time of the latest event of a port, None if it has none
+    fn next_event_time(&self, nid: u32) -> Option<i64> {
+        let st = self.inner.lock();
+        let latest = st.latest[nid as usize];
+        (latest.seq != 0).then_some(latest.time)
+    }
+
+    /// A new delay of a port (PortOutDelta.set_delay_ns())
+    fn set_delay(&self, nid: u32, delay: i64) {
+        self.inner.lock().delay[nid as usize] = delay;
     }
 
     /// The time of the next settle, None if there is none
