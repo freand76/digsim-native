@@ -106,6 +106,8 @@ struct BCell {
     small: u32,
     q: u32,
     old_clock: u8,
+    // A gate flip-flop or latch: its output after default_state() (0, 1 or X)
+    init: u8,
     gate: Option<GateCell>,
     extra: Option<Box<Extra>>,
     // Parameters of a functional cell: A_SIGNED, B_SIGNED (both for the operations that
@@ -235,6 +237,7 @@ pub struct CellArgs {
     pub word: Option<word::Cell>,
     pub gate: Option<GateCell>,
     pub old_clock: u8,
+    // A constant: its value, a gate flip-flop or latch: its initial value
     pub value: u8,
 }
 
@@ -491,6 +494,7 @@ impl Block {
                 clock_level,
                 q,
                 old_clock: args.old_clock,
+                init: args.value.min(X),
                 gate: args.gate,
                 extra,
                 a_signed,
@@ -1152,8 +1156,9 @@ impl Block {
         self.fanout_range(slot, low, high, diff, None);
     }
 
-    /// The registers start at 0, in the next settle (after their delay), and the constants
-    /// get their values now (GND and VDD have no delay)
+    /// The registers start at their initial values (undefined unless the netlist has
+    /// one), in the next settle (after their delay), and the constants get their values
+    /// now (GND and VDD have no delay)
     pub fn default_state(&mut self) {
         #[cfg(feature = "prof")]
         {
@@ -1221,6 +1226,25 @@ impl Block {
             self.v[base..base + count].fill(0);
             self.x[base..base + count].fill(0);
             self.c1[q as usize] = 0;
+            if let Some(extra) = self.cells[c].extra.as_ref() {
+                let init = &extra.word.init;
+                for (i, w) in init.v.to_words().into_iter().take(count).enumerate() {
+                    self.v[base + i] = w;
+                }
+                for (i, w) in init.u.to_words().into_iter().take(count).enumerate() {
+                    self.x[base + i] = w;
+                }
+                self.c1[q as usize] = if self.x[base] & 1 != 0 {
+                    X
+                } else {
+                    (self.v[base] & 1) as u8
+                };
+            } else if matches!(self.cells[c].op, Op::Gate(_)) {
+                let init = self.cells[c].init;
+                self.v[base] = (init == 1) as u64;
+                self.x[base] = (init == X) as u64;
+                self.c1[q as usize] = init;
+            }
             match self.cells[c].op {
                 Op::Const(value) => {
                     self.v[base] = value as u64;
@@ -1232,7 +1256,7 @@ impl Block {
                 }
                 _ => {
                     if let Some(extra) = self.cells[c].extra.as_mut() {
-                        extra.word.q = word::Word::default();
+                        extra.word.q = extra.word.init.clone();
                     }
                     self.set_pending(c);
                 }

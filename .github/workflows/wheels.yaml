@@ -15,8 +15,8 @@ permissions:
   contents: read
 
 env:
-  # The DigSim release that has the engine interface of this version
-  DIGSIM_REF: v1.11.0
+  # The DigSim that has the engine interface of this version (main until it is released)
+  DIGSIM_REF: main
 
 jobs:
   check:

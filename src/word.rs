@@ -297,6 +297,8 @@ pub struct Cell {
     pub q: Word,
     pub old_clock: u8,
     pub(crate) width: usize,
+    // Registers: Q after default_state()
+    pub init: Word,
     // Decoder: the values, the outputs for no match, and the outputs each value flips
     pub(crate) values: Vec<W>,
     pub(crate) none: W,
@@ -340,6 +342,7 @@ impl Cell {
             q,
             old_clock,
             width: 0,
+            init: Word::default(),
             values: Vec::new(),
             none: W::zero(),
             flips: HashMap::new(),
@@ -537,8 +540,8 @@ impl Cell {
     }
 
     pub fn default_state(&mut self, events: &mut Vec<Write>) {
-        self.q = Word::default();
-        self.write(0, Word::default(), events);
+        self.q = self.init.clone();
+        self.write(0, self.init.clone(), events);
     }
 
     pub fn is_register(&self) -> bool {

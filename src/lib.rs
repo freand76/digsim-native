@@ -753,7 +753,8 @@ pub(crate) fn eval_gate(cell: &mut Cell, v: impl Fn(usize) -> u8) -> Option<u8> 
 
 // A functional cell from Python: kind, inputs (width, update, bits, undefined bits),
 // outputs (width, bit ports, bits with ports that drive something, word port, links, last
-// value), parameters, Q, the clock level and if a tristate buffer drives
+// value), parameters, Q, the clock level, if a tristate buffer drives, and the initial Q
+// of a register
 type WordCellArgs = (
     u8,
     Vec<(usize, bool, BigUint, BigUint)>,
@@ -769,6 +770,7 @@ type WordCellArgs = (
     (BigUint, BigUint),
     u8,
     bool,
+    (BigUint, BigUint),
 );
 
 /// The cells that a port drives without a delay: through wires, buses and their bits,
@@ -942,7 +944,7 @@ fn cell_ranks(
 
 /// A functional cell from its arguments from Python
 fn make_word_cell(args: WordCellArgs) -> PyResult<word::Cell> {
-    let (kind, inputs, outputs, params, q, old_clock, driving) = args;
+    let (kind, inputs, outputs, params, q, old_clock, driving, init) = args;
     let kind = *word::KINDS
         .get(kind as usize)
         .ok_or_else(|| PyValueError::new_err(format!("Unknown functional cell kind {kind}")))?;
@@ -974,7 +976,7 @@ fn make_word_cell(args: WordCellArgs) -> PyResult<word::Cell> {
             },
         )
         .collect();
-    Ok(word::Cell::new(
+    let mut cell = word::Cell::new(
         kind,
         inputs,
         outputs,
@@ -985,13 +987,18 @@ fn make_word_cell(args: WordCellArgs) -> PyResult<word::Cell> {
         },
         old_clock,
         driving,
-    ))
+    );
+    cell.init = word::Word {
+        v: init.0.into(),
+        u: init.1.into(),
+    };
+    Ok(cell)
 }
 
 // A cell of a block from Python: op (0 functional, 1 gate, 2 constant), the gate kind,
 // inputs (their bits as (slot, bit), if they update the cell), output slots, rank (NONE
 // for a stateful cell), the functional cell, the levels and clock of a gate, the value
-// of a constant
+// of a constant or the initial value (0, 1 or X) of a gate flip-flop or latch
 type BlockCellArgs = (
     u8,
     u8,
@@ -2318,5 +2325,7 @@ impl Engine {
 #[pymodule]
 fn digsim_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Engine>()?;
+    // The version of the interface to DigSim: 4 has the initial values of the registers
+    m.add("INTERFACE", 4)?;
     Ok(())
 }
