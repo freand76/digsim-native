@@ -204,6 +204,8 @@ pub struct Block {
     // A block of gates only: the arrays of the sweep (see prepare_sweep())
     smalls: Vec<Small>,
     sweep: bool,
+    // The slots with only ports inside for the VCD file (see set_vcd_on())
+    vcd_notify: Vec<u32>,
     sweep_gates: Vec<SweepGate>,
     // The gates (combinational) that read each slot, for eval_sweep_gate()
     gate_readers_start: Vec<u32>,
@@ -295,6 +297,7 @@ impl Block {
             record: None,
             smalls: Vec::new(),
             sweep: false,
+            vcd_notify: Vec::new(),
             sweep_gates: Vec::new(),
             gate_readers_start: Vec::new(),
             gate_readers: Vec::new(),
@@ -858,6 +861,9 @@ impl Block {
             let mut flags = 0;
             if self.pin_start[slot] != self.pin_start[slot + 1] {
                 flags |= 1;
+            } else if self.vcd_start[slot] != self.vcd_start[slot + 1] {
+                // Only ports inside for the VCD file: marked while there is one
+                self.vcd_notify.push(slot as u32);
             }
             for i in self.fan_start[slot] as usize..self.fan_start[slot + 1] as usize {
                 let entry = self.fan[i].0;
@@ -885,6 +891,25 @@ impl Block {
             self.gate_readers_start.push(self.gate_readers.len() as u32);
         }
         self.sweep = true;
+        let on = self.vcd_on;
+        self.vcd_on = !on;
+        self.set_vcd_on(on);
+    }
+
+    /// A VCD file or none: the slots with only ports inside for it are marked as changed
+    /// by the sweep while there is one
+    fn set_vcd_on(&mut self, on: bool) {
+        if self.vcd_on == on {
+            return;
+        }
+        self.vcd_on = on;
+        for &slot in &self.vcd_notify {
+            if on {
+                self.notify[slot as usize] |= 1;
+            } else {
+                self.notify[slot as usize] &= !1;
+            }
+        }
     }
 
     /// Evaluate all gates (see prepare_sweep())
@@ -1206,7 +1231,7 @@ impl Block {
     }
 
     fn default_state_now(&mut self) {
-        self.vcd_on = true;
+        self.set_vcd_on(true);
         for i in 0..self.literals.len() {
             let (slot, bit, value) = self.literals[i];
             let base = self.start[slot as usize] as usize;
@@ -1492,7 +1517,7 @@ impl Block {
             calls.push(Call::Settle);
         }
         let _whole = crate::prof::Timer::new(106);
-        self.vcd_on = vcd_wanted;
+        self.set_vcd_on(vcd_wanted);
         // Like the regions of Verilog: the combinational cells settle, the flip-flops whose
         // clock (or reset) a combinational cell changed then see the settled values, then
         // the new outputs of the flip-flops (like non-blocking assignments), again until
@@ -1500,7 +1525,7 @@ impl Block {
         // settle, one ns later.
         for _round in 0..ROUNDS {
             self.in_comb = true;
-            if self.sweep && !vcd_wanted && self.low < self.dirty.len() {
+            if self.sweep && self.low < self.dirty.len() {
                 // Many dirty gates (or many in the last settle): a sweep of all is faster
                 let frontier: u32 = self.dirty[self.low..].iter().map(|w| w.count_ones()).sum();
                 let n = self.ncomb as u64;
