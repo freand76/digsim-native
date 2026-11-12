@@ -1,8 +1,9 @@
 name: Wheels
 
 # Builds the wheels (abi3, one per platform for every Python from 3.11) and tests those that
-# run on the build runner with the DigSim tests (test: full), or only imports them. A tag
-# vX.Y.Z attaches them to a release.
+# run on the build runner with the tests in tests/ (test: full), or only imports them. A tag
+# vX.Y.Z attaches them to a release. It doesn't test DigSim, so a push never depends on it:
+# test with DigSim locally first (tools/native/test_local_native.sh in DigSim).
 
 on:
   push:
@@ -14,10 +15,6 @@ on:
 permissions:
   contents: read
 
-env:
-  # The DigSim that has the engine interface of this version (main until it is released)
-  DIGSIM_REF: main
-
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -27,7 +24,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo clippy --release -- -D warnings
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo test --release
 
   wheels:
     name: wheel ${{ matrix.name }}
@@ -84,22 +82,13 @@ jobs:
           python -m pip install dist/*.whl
           python -c "import digsim_native; digsim_native.Engine"
 
-      - uses: actions/checkout@v7
-        if: matrix.test == 'full'
-        with:
-          repository: freand76/digsim
-          ref: ${{ env.DIGSIM_REF }}
-          path: digsim
-
-      - name: Test with DigSim
+      - name: Test
         if: matrix.test == 'full'
         shell: bash
-        working-directory: digsim
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ../dist/*.whl . "pytest==9.1.1"
-          python -c "from digsim.circuit import _native; assert _native.mode() == 'native'"
-          python -m pytest -q
+          python -m pip install dist/*.whl "pyvcd==0.5.0" "pytest==9.1.1"
+          python -m pytest -q tests
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

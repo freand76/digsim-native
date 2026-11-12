@@ -50,18 +50,27 @@ next to each other in the writer.
 pip install maturin
 maturin build --release              # the wheel, in target/wheels/
 pip install target/wheels/*.whl      # into the environment of DigSim
-cargo fmt --check && cargo clippy --release -- -D warnings
+cargo fmt --check && cargo clippy --release --all-targets -- -D warnings && cargo test --release
 ```
 
-The tests are in DigSim (its pytest, and `tools/native/`).
+`tests/` has the tests that don't need DigSim (`pip install <wheel> pyvcd==0.5.0 pytest`,
+`pytest tests`), the CI runs them on every push. The tests of the engine are in DigSim
+(its pytest, and `tools/native/`): `sh tools/native/test_local_native.sh` in DigSim builds
+this folder (next to it) and runs them, before a push. The CI doesn't run DigSim, so a
+push never depends on it.
+
+A new version works with the DigSim that pins the version before it, and DigSim works
+with both (it checks `INTERFACE`): either can be pushed first. A change that DigSim must
+follow keeps the old interface until DigSim's pin has passed it.
 
 ## Releases
 
-1. Bump `version` in `Cargo.toml` and `pyproject.toml`, and the pin in DigSim.
+1. Bump `version` in `Cargo.toml` and `pyproject.toml`.
 2. Push a tag `vX.Y.Z`. The `Wheels` workflow builds and tests the wheels and attaches
    them to a release.
 3. To upload them to PyPI: `gh workflow run pypi.yaml -f tag=vX.Y.Z`. PyPI trusts the
    workflow (Trusted Publishing: publisher `freand76/digsim-native`, workflow
    `pypi.yaml`, environment `pypi`), so it needs no token.
+4. Bump the pin in DigSim.
 
 The interface to DigSim isn't stable, so DigSim pins the version it was written for.
