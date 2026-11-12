@@ -37,6 +37,10 @@ for each of its cells, with events, and so do the native cells outside blocks (w
 levels instead of delays between them, see `src/levels.rs`). With `levels=False`
 (`DIGSIM_BLOCKS=0` in DigSim) every cell has its delay and events, exactly like in Python.
 
+`VcdWriter` (`src/vcd.rs`) writes the VCD files of DigSim, the same text as pyvcd. The
+engine writes the changes of its ports to it without calling Python, a port's variables
+next to each other in the writer.
+
 `cargo build --release --features prof` adds time counters (`Engine.profile()`) and
 `Engine.block_replay()`, which times the calls of a block again without Python.
 

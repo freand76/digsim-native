@@ -21,6 +21,7 @@ mod levels;
 mod lock;
 pub mod prof;
 mod queue;
+mod vcd;
 mod word;
 use num_bigint::{BigInt, BigUint};
 
@@ -46,6 +47,11 @@ const CLOCK: u8 = 10; // The timer of a Clock (its feedback port): its events to
 
 // The port of the settle events in the queue, not a port
 const SETTLE: u32 = u32::MAX - 1;
+// The VCD variables of a port (vcd_table): not looked up yet, or written by Python
+const VCD_UNKNOWN: u32 = u32::MAX;
+const VCD_PYTHON: u32 = u32::MAX - 1;
+// In the end of a vcd_table entry: some of the variables are of Python ports
+const VCD_HAS_PYTHON: u32 = 1 << 31;
 
 /// The value of a bus: a number, or all bits the same code (X or Z)
 #[derive(Clone, Copy, PartialEq)]
@@ -275,6 +281,20 @@ fn mux4(s: u8, t: u8, a: u8, b: u8, c: u8, d: u8) -> u8 {
     mux(t, mux(s, a, b), mux(s, c, d))
 }
 
+/// Where the value of a VCD variable is, found once when its port is looked up: the
+/// ports the port drives often have the same (a bit of a slot of a block)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VcdSource {
+    // The one-bit value of a port
+    Value(u32),
+    // A native bus
+    Bus(u32),
+    // A bit of a slot of a block: (block, slot, bit)
+    Block(u32, u32, u32),
+    // A Python port, its value property
+    Python(u32),
+}
+
 struct Inner {
     time: i64,
     seq: u64,
@@ -330,6 +350,14 @@ struct Inner {
     // The ports that changed in a settle, for the VCD file
     collect_vcd: bool,
     vcd_ports: Vec<u32>,
+    // The native writer of the VCD file (WavesWriter.native), and for each port the
+    // variables it writes: vcd_vars[start..end] of (variable, where its value is), or
+    // (VCD_UNKNOWN or VCD_PYTHON, 0)
+    vcd_writer: Option<Py<vcd::VcdWriter>>,
+    vcd_table: Vec<(u32, u32)>,
+    vcd_vars: Vec<(u32, VcdSource)>,
+    // The values of the variables of a port with Python ports (see vcd_write_python())
+    vcd_values: Vec<(u32, vcd::V)>,
     // The compiled blocks (block.rs), and the (slot, bit) of each port of one (aux)
     blocks: Vec<block::Block>,
     block_bits: Vec<(u32, u32)>,
@@ -358,6 +386,35 @@ struct Inner {
 }
 
 impl Inner {
+    /// Where the value of a port is for the VCD file, like Engine.value() reads it
+    fn vcd_source(&self, p: usize) -> VcdSource {
+        match self.kind[p] {
+            PY => VcdSource::Python(p as u32),
+            BUS => VcdSource::Bus(self.owner[p]),
+            BLOCK_INNER => {
+                let (slot, bit) = self.block_bits[self.aux[p] as usize];
+                VcdSource::Block(self.owner[p], slot, bit)
+            }
+            _ => VcdSource::Value(p as u32),
+        }
+    }
+
+    /// The value of a native port for the VCD file (not a Python port)
+    #[inline]
+    fn vcd_value(&self, source: VcdSource) -> vcd::V {
+        match source {
+            VcdSource::Value(p) => vcd::V::code(self.value[p as usize]),
+            VcdSource::Bus(bus) => match self.buses[bus as usize].value {
+                BusValue::Int(v) => vcd::V::Small(v),
+                BusValue::Code(c) => vcd::V::code(c),
+            },
+            VcdSource::Block(block, slot, bit) => {
+                vcd::V::code(self.blocks[block as usize].code(slot, bit))
+            }
+            VcdSource::Python(_) => vcd::V::X,
+        }
+    }
+
     /// A combinational cell with a new input, evaluated in the next settle
     fn mark_dirty(&mut self, id: usize) {
         if self.dirty[id] {
@@ -1624,22 +1681,182 @@ impl<'a, 'py> Ctx<'a, 'py> {
         result?;
         if let Some(vcd) = vcd {
             let ports = std::mem::take(&mut self.st().vcd_ports);
-            let time = self.st().time;
-            let engine = self.engine;
-            self.guard = None;
-            let mut result = Ok(());
-            for port in ports {
-                if let Err(error) = vcd.call_method1(
-                    intern!(self.py, "write"),
-                    (engine.port(self.py, port as usize), time),
-                ) {
-                    result = Err(error);
-                    break;
-                }
+            for &port in &ports {
+                self.vcd_write(vcd, port)?;
             }
-            self.guard = Some(engine.inner.lock());
-            result?;
+            // The vector keeps its memory for the next settle
+            let st = self.st();
+            if st.vcd_ports.is_empty() {
+                st.vcd_ports = ports;
+                st.vcd_ports.clear();
+            }
         }
+        Ok(())
+    }
+
+    /// The native writer of the VCD file of a run: a new one has new variables
+    fn bind_vcd(&mut self, vcd: &Option<Bound<'py, PyAny>>) -> PyResult<()> {
+        let Some(vcd) = vcd else {
+            return Ok(());
+        };
+        let py = self.py;
+        // A WavesWriter without one (pyvcd) writes every port in Python
+        let writer = vcd.getattr(intern!(py, "native")).ok().and_then(|native| {
+            native
+                .cast::<vcd::VcdWriter>()
+                .ok()
+                .map(|w| w.clone().unbind())
+        });
+        let st = self.st();
+        let same = match (&st.vcd_writer, &writer) {
+            (Some(a), Some(b)) => a.as_ptr() == b.as_ptr(),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            st.vcd_writer = writer;
+            st.vcd_table.clear();
+            st.vcd_vars.clear();
+        }
+        Ok(())
+    }
+
+    /// WavesWriter.write() of a port: the engine writes the variables whose values it
+    /// has, the others are written in Python
+    fn vcd_write(&mut self, vcd: &Bound<'py, PyAny>, port: u32) -> PyResult<()> {
+        let py = self.py;
+        let p = port as usize;
+        let st = self.st();
+        if st.vcd_writer.is_some() {
+            if st.vcd_table.len() <= p {
+                let count = st.kind.len().max(p + 1);
+                st.vcd_table.resize(count, (VCD_UNKNOWN, 0));
+            }
+            if st.vcd_table[p].0 == VCD_UNKNOWN {
+                self.vcd_lookup(vcd, port)?;
+            }
+            let st: &Inner = self.st();
+            let (start, end) = st.vcd_table[p];
+            if start != VCD_PYTHON && end & VCD_HAS_PYTHON != 0 {
+                return self.vcd_write_python(start, end & !VCD_HAS_PYTHON);
+            }
+            if start != VCD_PYTHON {
+                let text = {
+                    let mut writer = st.vcd_writer.as_ref().unwrap().get().state();
+                    // The value of the last source, the next variable often has it too
+                    let mut last: Option<(VcdSource, vcd::V)> = None;
+                    for &(var, source) in &st.vcd_vars[start as usize..end as usize] {
+                        let value = match &last {
+                            Some((last_source, value)) if *last_source == source => value.clone(),
+                            _ => {
+                                let value = st.vcd_value(source);
+                                last = Some((source, value.clone()));
+                                value
+                            }
+                        };
+                        writer.change(var as usize, st.time, value)?;
+                    }
+                    writer.take_text(py, false)
+                };
+                return self.vcd_write_text(text);
+            }
+        }
+        let time = self.st().time;
+        let engine = self.engine;
+        self.guard = None;
+        let result = vcd.call_method1(intern!(py, "write"), (engine.port(py, p), time));
+        self.guard = Some(engine.inner.lock());
+        result.map(|_| ())
+    }
+
+    /// The variables of a port, some of Python ports: their values first (Python code
+    /// can't run while the writer is taken), then the changes
+    fn vcd_write_python(&mut self, start: u32, end: u32) -> PyResult<()> {
+        let py = self.py;
+        let engine = self.engine;
+        let mut values = std::mem::take(&mut self.st().vcd_values);
+        values.clear();
+        for i in start as usize..end as usize {
+            let st = self.st();
+            let (var, source) = st.vcd_vars[i];
+            let value = if let VcdSource::Python(port) = source {
+                self.guard = None;
+                let result = engine
+                    .port(py, port as usize)
+                    .getattr(intern!(py, "value"))
+                    .and_then(|value| vcd::V::from_py(&value));
+                self.guard = Some(engine.inner.lock());
+                result?
+            } else {
+                st.vcd_value(source)
+            };
+            values.push((var, value));
+        }
+        let st: &mut Inner = self.st();
+        let time = st.time;
+        let text = {
+            let mut writer = st.vcd_writer.as_ref().unwrap().get().state();
+            for (var, value) in values.drain(..) {
+                writer.change(var as usize, time, value)?;
+            }
+            writer.take_text(py, false)
+        };
+        st.vcd_values = values;
+        self.vcd_write_text(text)
+    }
+
+    /// Write a full buffer of the VCD file, the engine isn't taken meanwhile
+    fn vcd_write_text(&mut self, text: Option<(Py<PyAny>, String)>) -> PyResult<()> {
+        if text.is_none() {
+            return Ok(());
+        }
+        let engine = self.engine;
+        self.guard = None;
+        let result = vcd::write_text(self.py, text);
+        self.guard = Some(engine.inner.lock());
+        result
+    }
+
+    /// The VCD variables of a port, from WavesWriter.native_vars(): written by the
+    /// engine if they are all of its ports (Python ports too), not text
+    fn vcd_lookup(&mut self, vcd: &Bound<'py, PyAny>, port: u32) -> PyResult<()> {
+        let py = self.py;
+        let engine = self.engine;
+        let p = port as usize;
+        self.guard = None;
+        let result = vcd
+            .call_method1(intern!(py, "native_vars"), (engine.port(py, p),))
+            .and_then(|vars| vars.extract::<Option<Vec<(u32, u32)>>>());
+        self.guard = Some(engine.inner.lock());
+        let vars = result?;
+        let st = self.st();
+        let known = |source: u32| {
+            let s = source as usize;
+            s < st.kind.len() && st.kind[s] != WORD
+        };
+        let entry = match vars {
+            Some(vars) if vars.iter().all(|&(_, source)| known(source)) => {
+                let python = vars.iter().any(|&(_, s)| st.kind[s as usize] == PY);
+                // The variables of the port next to each other in the writer
+                let numbers: Vec<u32> = vars.iter().map(|&(var, _)| var).collect();
+                let slots = st
+                    .vcd_writer
+                    .as_ref()
+                    .unwrap()
+                    .get()
+                    .state()
+                    .place(&numbers)?;
+                let start = st.vcd_vars.len() as u32;
+                for (&(_, source), slot) in vars.iter().zip(slots) {
+                    let source = st.vcd_source(source as usize);
+                    st.vcd_vars.push((slot, source));
+                }
+                let end = st.vcd_vars.len() as u32;
+                (start, if python { end | VCD_HAS_PYTHON } else { end })
+            }
+            _ => (VCD_PYTHON, 0),
+        };
+        st.vcd_table[p] = entry;
         Ok(())
     }
 
@@ -1809,12 +2026,7 @@ impl<'a, 'py> Ctx<'a, 'py> {
                 }
             }
             if let Some(vcd) = vcd {
-                let time = self.st().time;
-                let engine = self.engine;
-                self.guard = None;
-                let result = vcd.call_method1(intern!(py, "write"), (engine.port(py, p), time));
-                self.guard = Some(engine.inner.lock());
-                result?;
+                self.vcd_write(vcd, event.port)?;
             }
             return Ok(Some(event.port));
         }
@@ -1960,6 +2172,10 @@ impl Engine {
                 dirty_buses: Vec::new(),
                 collect_vcd: false,
                 vcd_ports: Vec::new(),
+                vcd_writer: None,
+                vcd_table: Vec::new(),
+                vcd_vars: Vec::new(),
+                vcd_values: Vec::new(),
                 blocks: compiled,
                 block_bits,
                 block_queue: Vec::new(),
@@ -2098,6 +2314,7 @@ impl Engine {
     ) -> PyResult<bool> {
         let t0 = prof::now();
         let mut ctx = Ctx::new(py, self);
+        ctx.bind_vcd(&vcd)?;
         let original_stop = stop_time;
         let mut stop_time = stop_time;
         let mut single_step_stop = false;
@@ -2130,6 +2347,7 @@ impl Engine {
         vcd: Option<Bound<'_, PyAny>>,
     ) -> PyResult<(bool, bool)> {
         let mut ctx = Ctx::new(py, self);
+        ctx.bind_vcd(&vcd)?;
         Ok(match ctx.process(stop_time, &vcd)? {
             None => (false, false),
             Some(port) => (true, port != SETTLE && ctx.st().toplevel[port as usize]),
@@ -2325,7 +2543,9 @@ impl Engine {
 #[pymodule]
 fn digsim_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Engine>()?;
-    // The version of the interface to DigSim: 4 has the initial values of the registers
-    m.add("INTERFACE", 4)?;
+    m.add_class::<vcd::VcdWriter>()?;
+    // The version of the interface to DigSim: 4 has the initial values of the registers,
+    // 5 the VCD writer
+    m.add("INTERFACE", 5)?;
     Ok(())
 }
