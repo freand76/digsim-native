@@ -1709,9 +1709,8 @@ impl Block {
         if let Some(vcd) = vcd {
             for &slot in &changed {
                 let s = slot as usize;
-                for i in self.vcd_start[s] as usize..self.vcd_start[s + 1] as usize {
-                    vcd.push(self.vcd[i].1);
-                }
+                let ports = &self.vcd[self.vcd_start[s] as usize..self.vcd_start[s + 1] as usize];
+                vcd.extend(ports.iter().map(|&(_, port)| port));
             }
         }
         self.changed = changed;
