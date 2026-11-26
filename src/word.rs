@@ -539,6 +539,38 @@ impl Cell {
         self.write(0, word, events);
     }
 
+    /// A deposit on a bit of an output (0, 1 or X): the value now, as if the cell wrote
+    /// it, the events of its port and word. A register keeps it in Q until it writes
+    /// again (an active edge), another cell until an input changes. FunctionalCell.deposit().
+    pub fn deposit(&mut self, output: usize, bit: usize, code: u8, events: &mut Vec<Write>) {
+        let width = self.outputs[output].width;
+        let mut word = self.outputs[output]
+            .last
+            .clone()
+            .unwrap_or_else(|| undefined(width));
+        word.v.set_bit(bit, code == 1);
+        word.u.set_bit(bit, code > 1);
+        self.deposit_q(output, bit, code);
+        self.write(output, word, events);
+    }
+
+    /// The state of a deposit in a block, which has the value of the output: the last
+    /// value written, and Q of a register
+    pub fn deposit_state(&mut self, output: usize, bit: usize, code: u8) {
+        if let Some(last) = self.outputs[output].last.as_mut() {
+            last.v.set_bit(bit, code == 1);
+            last.u.set_bit(bit, code > 1);
+        }
+        self.deposit_q(output, bit, code);
+    }
+
+    fn deposit_q(&mut self, output: usize, bit: usize, code: u8) {
+        if output == 0 && self.is_register() {
+            self.q.v.set_bit(bit, code == 1);
+            self.q.u.set_bit(bit, code > 1);
+        }
+    }
+
     pub fn default_state(&mut self, events: &mut Vec<Write>) {
         self.q = self.init.clone();
         self.write(0, self.init.clone(), events);

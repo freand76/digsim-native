@@ -2298,6 +2298,94 @@ impl Engine {
         r
     }
 
+    /// Circuit.deposit() of the output of a gate cell: the value now, the cell keeps it
+    /// until it sets its output again (it has no other state)
+    #[pyo3(signature = (nid, value, vcd=None))]
+    fn deposit_port(
+        &self,
+        py: Python<'_>,
+        nid: u32,
+        value: Bound<'_, PyAny>,
+        vcd: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let code = bit_code(&value)?;
+        let mut ctx = Ctx::new(py, self);
+        ctx.bind_vcd(&vcd)?;
+        if ctx.st().value[nid as usize] == code {
+            return Ok(());
+        }
+        ctx.update_wires(nid, code)?;
+        if let Some(vcd) = &vcd {
+            ctx.vcd_write(vcd, nid)?;
+        }
+        Ok(())
+    }
+
+    /// Circuit.deposit() of a bit of an output of a functional cell, see Cell.deposit()
+    #[pyo3(signature = (cell, output, bit, value, vcd=None))]
+    fn deposit_word(
+        &self,
+        py: Python<'_>,
+        cell: u32,
+        output: u32,
+        bit: u32,
+        value: Bound<'_, PyAny>,
+        vcd: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let code = bit_code(&value)?;
+        let mut ctx = Ctx::new(py, self);
+        ctx.bind_vcd(&vcd)?;
+        let mut writes = Vec::new();
+        ctx.st().words[cell as usize].deposit(output as usize, bit as usize, code, &mut writes);
+        for write in writes {
+            match write {
+                word::Write::Bit(port, code) => {
+                    ctx.update_wires(port, code)?;
+                    if let Some(vcd) = &vcd {
+                        ctx.vcd_write(vcd, port)?;
+                    }
+                }
+                word::Write::Word(port, value) => ctx.word_event(port, &value),
+            }
+        }
+        Ok(())
+    }
+
+    /// Circuit.deposit() of a bit of a slot of a block, see Block.deposit(). Returns
+    /// False for a slot of a constant (GND or VDD), which can't be deposited.
+    #[pyo3(signature = (block, slot, bit, value, vcd=None))]
+    fn deposit_block(
+        &self,
+        py: Python<'_>,
+        block: u32,
+        slot: u32,
+        bit: u32,
+        value: Bound<'_, PyAny>,
+        vcd: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        let code = bit_code(&value)?;
+        let mut ctx = Ctx::new(py, self);
+        ctx.bind_vcd(&vcd)?;
+        let (mut out, mut inside) = (Vec::new(), Vec::new());
+        let b = block as usize;
+        let st = ctx.st();
+        let Some(settle) = st.blocks[b].deposit(slot, bit, code, &mut out, &mut inside) else {
+            return Ok(false);
+        };
+        if settle {
+            st.request_block(b);
+        }
+        for &(port, code) in &out {
+            ctx.update_wires(port, code)?;
+        }
+        if let Some(vcd) = &vcd {
+            for &port in &inside {
+                ctx.vcd_write(vcd, port)?;
+            }
+        }
+        Ok(true)
+    }
+
     #[staticmethod]
     fn profile() -> Vec<(usize, u64, u64)> {
         prof::dump()
@@ -2545,7 +2633,7 @@ fn digsim_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Engine>()?;
     m.add_class::<vcd::VcdWriter>()?;
     // The version of the interface to DigSim: 4 has the initial values of the registers,
-    // 5 the VCD writer
-    m.add("INTERFACE", 5)?;
+    // 5 the VCD writer, 6 the deposits (deposit_port(), deposit_word(), deposit_block())
+    m.add("INTERFACE", 6)?;
     Ok(())
 }

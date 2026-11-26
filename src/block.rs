@@ -204,6 +204,9 @@ pub struct Block {
     // A block of gates only: the arrays of the sweep (see prepare_sweep())
     smalls: Vec<Small>,
     sweep: bool,
+    // A gate has a deposit (see deposit()): no sweeps of all gates, which would evaluate it
+    // again, only the dirty gates
+    deposited: bool,
     // The slots with only ports inside for the VCD file (see set_vcd_on())
     vcd_notify: Vec<u32>,
     sweep_gates: Vec<SweepGate>,
@@ -297,6 +300,7 @@ impl Block {
             record: None,
             smalls: Vec::new(),
             sweep: false,
+            deposited: false,
             vcd_notify: Vec::new(),
             sweep_gates: Vec::new(),
             gate_readers_start: Vec::new(),
@@ -1080,6 +1084,82 @@ impl Block {
         self.needs_settle()
     }
 
+    /// A deposit on a bit of a slot (0, 1 or X), like Verilog's vpi_put_value() on a net
+    /// or register: the value now, the cell that drives the slot keeps it until it drives
+    /// again (a flip-flop at an active edge, a combinational cell when an input changes).
+    /// The ports outside that the bit drives are in out, the ports inside for the VCD file
+    /// in vcd. Returns if the block needs a settle, for the cells that read the bit, None
+    /// for a slot of a constant (GND or VDD), which can't be deposited.
+    pub fn deposit(
+        &mut self,
+        slot: u32,
+        bit: u32,
+        code: u8,
+        out: &mut Vec<(u32, u8)>,
+        vcd: &mut Vec<u32>,
+    ) -> Option<bool> {
+        let code = code.min(X);
+        let (v, x) = ((code == 1) as u64, (code == X) as u64);
+        // The cell that drives the slot, and its output
+        let driver = (0..self.cells.len()).find_map(|c| {
+            let cell = &self.cells[c];
+            let output = match cell.extra.as_ref() {
+                Some(extra) if !cell.stateful => extra.outputs.iter().position(|&o| o == slot),
+                _ => (cell.out == slot).then_some(0),
+            };
+            output.map(|output| (c, output))
+        });
+        if let Some((c, _)) = driver {
+            if matches!(self.cells[c].op, Op::Const(_)) {
+                return None;
+            }
+        }
+        let s = slot as usize;
+        let base = self.start[s] as usize;
+        if get_bits(&self.v, base, bit, 1) == v && get_bits(&self.x, base, bit, 1) == x {
+            return Some(self.needs_settle());
+        }
+        set_bits(&mut self.v, base, bit, 1, v);
+        set_bits(&mut self.x, base, bit, 1, x);
+        if bit == 0 {
+            self.c1[s] = code;
+        }
+        // The state of the driver, which it compares its next value with
+        if let Some((c, output)) = driver {
+            let cell = &self.cells[c];
+            if !cell.stateful {
+                self.deposited = true;
+            }
+            if cell.stateful {
+                let q = cell.q as usize;
+                let q_base = self.start[q] as usize;
+                set_bits(&mut self.v, q_base, bit, 1, v);
+                set_bits(&mut self.x, q_base, bit, 1, x);
+                if bit == 0 {
+                    self.c1[q] = code;
+                }
+            }
+            if let Some(extra) = self.cells[c].extra.as_mut() {
+                extra.word.deposit_state(output, bit as usize, code);
+            }
+        }
+        let pins = &self.pins[self.pin_start[s] as usize..self.pin_start[s + 1] as usize];
+        out.extend(
+            pins.iter()
+                .filter(|&&(b, _)| b == bit)
+                .map(|&(_, port)| (port, code)),
+        );
+        let ports = &self.vcd[self.vcd_start[s] as usize..self.vcd_start[s + 1] as usize];
+        vcd.extend(
+            ports
+                .iter()
+                .filter(|&&(b, _)| b == bit)
+                .map(|&(_, port)| port),
+        );
+        self.fanout_bits(slot, bit, bit + 1);
+        Some(self.needs_settle())
+    }
+
     /// An input word of up to 64 bits from outside the block (bits, undefined bits).
     /// Returns if the block needs a settle.
     pub fn set_input_word(&mut self, slot: u32, v: u64, x: u64) -> bool {
@@ -1231,6 +1311,8 @@ impl Block {
     }
 
     fn default_state_now(&mut self) {
+        // The deposits are gone: the gates can sweep again
+        self.deposited = false;
         self.set_vcd_on(true);
         for i in 0..self.literals.len() {
             let (slot, bit, value) = self.literals[i];
@@ -1525,7 +1607,7 @@ impl Block {
         // settle, one ns later.
         for _round in 0..ROUNDS {
             self.in_comb = true;
-            if self.sweep && self.low < self.dirty.len() {
+            if self.sweep && !self.deposited && self.low < self.dirty.len() {
                 // Many dirty gates (or many in the last settle): a sweep of all is faster
                 let frontier: u32 = self.dirty[self.low..].iter().map(|w| w.count_ones()).sum();
                 let n = self.ncomb as u64;

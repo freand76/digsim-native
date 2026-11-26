@@ -37,6 +37,12 @@ for each of its cells, with events, and so do the native cells outside blocks (w
 levels instead of delays between them, see `src/levels.rs`). With `levels=False`
 (`DIGSIM_BLOCKS=0` in DigSim) every cell has its delay and events, exactly like in Python.
 
+`Engine.deposit_port()`, `deposit_word()` and `deposit_block()` are the deposits of DigSim
+(`YosysComponent.deposit()`, like Verilog's `vpi_put_value()`): a cell output, or a slot
+of a block, has a value now, and the cell keeps it until it drives again, a flip-flop at
+its next active edge, a combinational cell when an input changes. A block with a deposit
+on a gate evaluates only its dirty gates from then on, without sweeps.
+
 `VcdWriter` (`src/vcd.rs`) writes the VCD files of DigSim, the same text as pyvcd. The
 engine writes the changes of its ports to it without calling Python, a port's variables
 next to each other in the writer.
